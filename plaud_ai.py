@@ -528,6 +528,18 @@ def slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:60] or "recording"
 
 
+def unique_path(path: Path) -> Path:
+    """`path`, or the first free `name-2.md`, `name-3.md`…: a note is never written over another."""
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr) -> Path:
     fid, title = rec_id(rec), rec.get("name") or rec_id(rec)
     transcript = fetch_transcript(plaud, fid)
@@ -536,7 +548,7 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     log(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}")
     body = run_task(backend, transcript, instructions, title, log)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md"
+    path = unique_path(out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md")
     path.write_text(
         f"# {title}\n\n- Date: {recording_date(rec)}\n- Duration: {duration(rec)}\n- Plaud file ID: `{fid}`\n"
         f"- Processed by: {backend.name} on {datetime.now():%Y-%m-%d %H:%M}\n\n{body}\n"

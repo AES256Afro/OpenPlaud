@@ -252,7 +252,8 @@ body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui
 main { max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
 header { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:baseline; justify-content:space-between; margin-bottom:16px; }
 h1 { font-size:22px; margin:0; } h2 { font-size:16px; margin:0 0 10px; }
-a { color:var(--accent); } td { overflow-wrap:anywhere; } td:first-child { white-space:nowrap; }
+a { color:var(--accent); }
+ul.folders { list-style:none; padding:0; margin:0 0 12px; display:flex; flex-wrap:wrap; gap:8px 20px; } td { overflow-wrap:anywhere; } td:first-child { white-space:nowrap; }
 .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
 .muted { color:var(--muted); } .ok { color:var(--ok); } .bad { color:var(--bad); }
 .meta { display:flex; flex-wrap:wrap; gap:6px 18px; font-size:14px; }
@@ -342,13 +343,90 @@ def model_label(cfg: dict) -> str:
     return f"{PROVIDER_LABELS.get(provider, provider)} · {model}"
 
 
-def note_files(cfg: dict) -> list[Path]:
-    d = pa.notes_dir(cfg)
-    return sorted(d.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True) if d.exists() else []
+# ---------------------------------------------------------------- notes and folders (nothing is ever deleted)
+
+FOLDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,59}")
+PATH_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,199}")
 
 
-def dashboard(flash: str | None) -> str:
+def inside(root: Path, rel: str) -> Path | None:
+    """The path `rel` names under `root`, or None when it is malformed or would leave it."""
+    rel = rel.strip("/")
+    if rel and not all(PATH_PART.fullmatch(part) for part in rel.split("/")):
+        return None
+    path = (root / rel).resolve()
+    return path if path == root or root in path.parents else None
+
+
+def rel_of(root: Path, path: Path) -> str:
+    return path.resolve().relative_to(root).as_posix()
+
+
+def note_url(root: Path, path: Path) -> str:
+    return "/notes/" + urllib.parse.quote(rel_of(root, path))
+
+
+def folder_url(rel: str) -> str:
+    return "/?" + urllib.parse.urlencode({"folder": rel}) + "#notes" if rel else "/#notes"
+
+
+def all_folders(root: Path) -> list[str]:
+    return sorted(rel_of(root, p) for p in root.rglob("*") if p.is_dir() and not any(s.startswith(".") for s in p.relative_to(root).parts))
+
+
+def note_for(root: Path, entry: dict | None) -> Path | None:
+    """Where a processed recording's note is now, following it if it was moved by hand."""
+    if not entry or not entry.get("file"):
+        return None
+    path = Path(entry["file"]).resolve()
+    if path.exists() and root in path.parents:
+        return path
+    return next(iter(sorted(root.rglob(path.name))), None)
+
+
+def move_note(root: Path, note: Path, folder: Path) -> Path:
+    target = pa.unique_path(folder / note.name)
+    note.rename(target)
+    state = pa.load_state()
+    for entry in state["processed"].values():
+        if entry.get("file") and Path(entry["file"]).resolve() == note.resolve():
+            entry["file"] = str(target)
+    pa.save_state(state)
+    return target
+
+
+def notes_panel(root: Path, current: str) -> str:
+    e = html.escape
+    here = inside(root, current) or root
+    current = rel_of(root, here) if here != root else ""
+    crumbs = ['<a href="/#notes">Notes</a>']
+    for i, part in enumerate(current.split("/") if current else []):
+        crumbs.append(f'<a href="{e(folder_url("/".join(current.split("/")[:i + 1])))}">{e(part)}</a>')
+    subfolders = sorted(p for p in here.iterdir() if p.is_dir() and not p.name.startswith(".")) if here.exists() else []
+    notes = sorted(here.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True) if here.exists() else []
+    folders = [""] + all_folders(root)
+    folder_items = "".join(
+        f'<li>📁 <a href="{e(folder_url(rel_of(root, p)))}">{e(p.name)}</a> <span class="muted">{sum(1 for _ in p.rglob("*.md"))}</span></li>'
+        for p in subfolders)
+    note_rows = []
+    for note in notes:
+        options = "".join(f'<option value="{e(f)}">{e(f or "Top level")}</option>' for f in folders if f != current)
+        move = (f"""<form class="inline" method="post" action="/notes/move"><input type="hidden" name="note" value="{e(rel_of(root, note))}">
+<input type="hidden" name="back" value="{e(current)}"><select name="dest" aria-label="Move to">{options}</select><button>Move</button></form>""") if options else ""
+        note_rows.append(f'<tr><td><a href="{e(note_url(root, note))}">{e(note.stem)}</a></td><td>{move}</td></tr>')
+    body = (f"<ul class='folders'>{folder_items}</ul>" if folder_items else "") + (
+        f"<div class='scroll'><table>{''.join(note_rows)}</table></div>" if note_rows
+        else '<p class="muted">No notes in this folder.</p>')
+    return f"""<div class="panel" id="notes"><div class="meta" style="justify-content:space-between;margin-bottom:8px">
+<h2 style="margin:0">{' / '.join(crumbs)}</h2>
+<form class="inline" method="post" action="/folders"><input type="hidden" name="parent" value="{e(current)}">
+<input type="text" name="name" placeholder="New folder" required maxlength="60" style="width:160px" aria-label="New folder name"><button>Create</button></form></div>
+{body}<p class="muted">New notes arrive in the top level. Moving a note never replaces another; nothing here is ever deleted.</p></div>"""
+
+
+def dashboard(flash: str | None, folder: str = "") -> str:
     cfg = pa.load_config()
+    root = pa.notes_dir(cfg)
     e = html.escape
     parts = [f"""<header><h1>OpenPlaud</h1><div class="meta muted"><span>{e(model_label(cfg))}</span>
 <span>{'Auto-sync every ' + str(SYNC_EVERY_MIN) + ' min' if SYNC_EVERY_MIN else 'Auto-sync off'}</span></div></header>"""]
@@ -399,8 +477,8 @@ Copy that whole address from the address bar and paste it here within 2 minutes:
         for r in recs or []:
             rid = pa.rec_id(r)
             when = pa.recorded_at(r)
-            note = done.get(rid, {}).get("file")
-            status = f'<a href="notes/{e(Path(note).name)}">Notes</a>' if note and Path(note).exists() else '<span class="muted">Not yet</span>'
+            note = note_for(root, done.get(rid))
+            status = f'<a href="{e(note_url(root, note))}">Notes</a>' if note else '<span class="muted">Not yet</span>'
             rows.append(f"""<tr><td>{e(when.strftime('%Y-%m-%d %H:%M') if when else '?')}</td><td class="hide-sm">{e(pa.duration(r))}</td>
 <td>{e(r.get('name') or rid)}</td><td>{status}</td><td><form class="inline" method="post" action="process">
 <input type="hidden" name="id" value="{e(rid)}"><select name="task" aria-label="Task">{task_options}</select><button>Run</button></form></td></tr>""")
@@ -409,10 +487,7 @@ Copy that whole address from the address bar and paste it here within 2 minutes:
         parts.append(f"""<div class="panel"><div class="meta" style="justify-content:space-between;margin-bottom:8px">
 <h2 style="margin:0">Recordings · last {LIST_DAYS} days</h2><form class="inline" method="post" action="sync"><button class="primary">Sync now</button></form></div>{table}</div>""")
 
-    notes = note_files(cfg)
-    if notes:
-        items = "".join(f'<li><a href="notes/{e(p.name)}">{e(p.stem)}</a></li>' for p in notes[:50])
-        parts.append(f'<div class="panel"><h2>Notes</h2><ul>{items}</ul></div>')
+    parts.append(notes_panel(root, folder))
     if PASSWORD:
         parts.append('<form method="post" action="logout"><button>Sign out of OpenPlaud</button></form>')
     return page("OpenPlaud", "".join(parts), refresh=busy or st["status"] == "waiting")
@@ -450,7 +525,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _redirect(self, to: str = "./", flash: str | None = None, headers: dict | None = None):
         if flash:
-            to += ("&" if "?" in to else "?") + urllib.parse.urlencode({"msg": flash})
+            to, hash_, fragment = to.partition("#")
+            to += ("&" if "?" in to else "?") + urllib.parse.urlencode({"msg": flash}) + hash_ + fragment
         self.send_response(303)
         self.send_header("Location", to)
         for k, v in (headers or {}).items():
@@ -489,8 +565,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(200 if path == "/login" else 401, login_page())
         if path == "/":
-            flash = urllib.parse.parse_qs(url.query).get("msg", [None])[0]
-            return self._send(200, dashboard(flash))
+            query = urllib.parse.parse_qs(url.query)
+            return self._send(200, dashboard(query.get("msg", [None])[0], query.get("folder", [""])[0]))
         if path == "/api/status":
             body = {"busy": bool(jobs.current) or not jobs.queue.empty(), "current": jobs.current,
                     "log": list(jobs.log)[-80:], "signin": signin.state["status"]}
@@ -499,19 +575,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._note(path.removeprefix("/notes/"), "raw" in urllib.parse.parse_qs(url.query))
         self._send(404, page("Not found", '<p>Not found. <a href="/">Back</a></p>'))
 
-    def _note(self, name: str, raw: bool):
-        name = urllib.parse.unquote(name)
-        cfg = pa.load_config()
-        target = pa.notes_dir(cfg) / name
-        if not re.fullmatch(r"[A-Za-z0-9._-]+\.md", name) or not target.is_file():
-            return self._send(404, page("Not found", '<p>No such note. <a href="../">Back</a></p>'))
+    def _note(self, rel: str, raw: bool):
+        root = pa.notes_dir(pa.load_config())
+        target = inside(root, urllib.parse.unquote(rel))
+        if not target or target.suffix != ".md" or not target.is_file():
+            return self._send(404, page("Not found", '<p>No such note. <a href="/#notes">Back</a></p>'))
         text = target.read_text()
         if raw:
             return self._send(200, text, "text/markdown; charset=utf-8",
-                              {"Content-Disposition": f'attachment; filename="{name}"'})
-        body = f"""<p><a href="../">← OpenPlaud</a> · <a href="{html.escape(name)}?raw=1">Download Markdown</a></p>
+                              {"Content-Disposition": f'attachment; filename="{target.name}"'})
+        folder = rel_of(root, target.parent) if target.parent != root else ""
+        back = html.escape(folder_url(folder))
+        body = f"""<p><a href="{back}">← {html.escape(folder or "OpenPlaud")}</a> · <a href="{html.escape(note_url(root, target))}?raw=1">Download Markdown</a></p>
 <div class="panel note">{render_markdown(text)}</div>"""
-        self._send(200, page(name, body))
+        self._send(200, page(target.name, body))
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path.rstrip("/")
@@ -545,6 +622,20 @@ class Handler(BaseHTTPRequestHandler):
             plaud.forget()
             signin.state = {"status": "idle", "url": None, "message": None}
             return self._redirect("../", "Signed out of Plaud.")
+        if path == "/folders":
+            root = pa.notes_dir(pa.load_config())
+            parent, name = inside(root, form.get("parent", "")), form.get("name", "").strip()
+            if not parent or not FOLDER_NAME.fullmatch(name):
+                return self._redirect(folder_url(form.get("parent", "")), "Folder names use letters, numbers, spaces, dots, dashes and underscores.")
+            (parent / name).mkdir(parents=True, exist_ok=True)
+            return self._redirect(folder_url(rel_of(root, parent / name)), f"Folder {name} is ready.")
+        if path == "/notes/move":
+            root = pa.notes_dir(pa.load_config())
+            note, dest = inside(root, form.get("note", "")), inside(root, form.get("dest", ""))
+            if not note or note.suffix != ".md" or not note.is_file() or not dest or not dest.is_dir():
+                return self._redirect(folder_url(form.get("back", "")), "That note or folder doesn't exist.")
+            moved = move_note(root, note, dest)
+            return self._redirect(folder_url(form.get("back", "")), f"Moved to {rel_of(root, dest) if dest != root else 'the top level'} as {moved.name}.")
         if path == "/sync":
             added = jobs.add(("sync",))
             return self._redirect("./", "Sync queued." if added else "A sync is already queued.")
