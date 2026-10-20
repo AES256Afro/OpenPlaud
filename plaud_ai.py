@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["anthropic>=1.0"]
 # ///
-"""Run your Plaud recordings through your own model: a local LLM over Tailscale, or Claude.
+"""Run your Plaud recordings through your own model: Claude, ChatGPT, or a local model (Ollama).
 
 Plaud data comes from the official Plaud MCP server (@plaud-ai/mcp), driven over stdio,
 so it reuses the same Plaud sign-in as Claude Code's Plaud tools.
@@ -11,6 +11,7 @@ so it reuses the same Plaud sign-in as Claude Code's Plaud tools.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -25,21 +26,38 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("PLAUD_AI_CONFIG", HERE / "plaud_ai.toml"))
-STATE_PATH = HERE / ".plaud_ai_state.json"
+DATA_DIR = Path(os.environ.get("OPENPLAUD_DATA", HERE))
+STATE_PATH = DATA_DIR / ".plaud_ai_state.json"
+PROVIDERS = ("claude", "chatgpt", "local")
 
 DEFAULT_CONFIG = {
     "backend": "claude",
     "output_dir": "notes",
     "local": {
         "kind": "ollama",
-        "base_url": "http://bigbox:11434",
+        "base_url": "http://localhost:11434",
         "model": "qwen3:30b-a3b",
         "think": False,
         "max_context": 32768,
         "timeout": 900,
     },
     "claude": {"model": "claude-haiku-5-5", "effort": "medium", "max_tokens": 32000},
+    "chatgpt": {"model": "gpt-5-mini", "base_url": "https://api.openai.com/v1", "timeout": 600},
     "plaud": {"command": []},
+}
+
+# Environment variables override plaud_ai.toml, so a container is configured entirely from its settings.
+ENV_OVERRIDES = {
+    "OPENPLAUD_PROVIDER": ("backend",),
+    "CLAUDE_MODEL": ("claude", "model"),
+    "CLAUDE_EFFORT": ("claude", "effort"),
+    "OPENAI_MODEL": ("chatgpt", "model"),
+    "OPENAI_BASE_URL": ("chatgpt", "base_url"),
+    "OLLAMA_URL": ("local", "base_url"),
+    "PLAUD_AI_LOCAL_URL": ("local", "base_url"),
+    "LOCAL_MODEL": ("local", "model"),
+    "PLAUD_AI_LOCAL_MODEL": ("local", "model"),
+    "LOCAL_MAX_CONTEXT": ("local", "max_context"),
 }
 
 SYSTEM_PROMPT = """You process transcripts of recordings made on a Plaud voice recorder.
@@ -85,14 +103,22 @@ def load_dotenv(path: Path = HERE / ".env") -> None:
 
 def load_config() -> dict:
     load_dotenv()
-    cfg = DEFAULT_CONFIG
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         cfg = deep_merge(cfg, tomllib.loads(CONFIG_PATH.read_text()))
-    if url := os.environ.get("PLAUD_AI_LOCAL_URL"):
-        cfg["local"]["base_url"] = url
-    if model := os.environ.get("PLAUD_AI_LOCAL_MODEL"):
-        cfg["local"]["model"] = model
+    for var, path in ENV_OVERRIDES.items():
+        value = os.environ.get(var, "").strip()
+        if not value:
+            continue
+        target = cfg
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = int(value) if isinstance(target.get(path[-1]), int) else value
     return cfg
+
+
+def notes_dir(cfg: dict) -> Path:
+    return (DATA_DIR / cfg["output_dir"]).resolve()
 
 
 def load_state() -> dict:
@@ -109,8 +135,16 @@ class PlaudError(RuntimeError):
     pass
 
 
+class NotSignedIn(PlaudError):
+    pass
+
+
 class NoTranscript(Exception):
     pass
+
+
+def log_stderr(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 class Plaud:
@@ -165,9 +199,12 @@ class Plaud:
         text = "\n".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
         if result.get("isError"):
             if "Not authenticated" in text or "401" in text:
-                raise PlaudError("Not signed in to Plaud. Run: uv run plaud_ai.py login")
+                raise NotSignedIn("Not signed in to Plaud.")
             raise PlaudError(text)
         return text
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
 
     def call_json(self, tool: str, **args):
         return json.loads(unwrap(self.call(tool, **args)))
@@ -406,15 +443,59 @@ class ClaudeBackend:
         return f"Claude {self.cfg['model']}: credentials OK"
 
 
+class ChatGPTBackend:
+    """OpenAI's Chat Completions API. No sampling parameters: current OpenAI reasoning models reject them."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.base = cfg["base_url"].rstrip("/")
+        self.name = cfg["model"]
+
+    def max_input_tokens(self) -> int:
+        return 200_000
+
+    def _request(self, path: str, body: dict | None = None) -> dict:
+        if not self.key:
+            raise RuntimeError("No OpenAI key. Set OPENAI_API_KEY (create one at platform.openai.com).")
+        req = urllib.request.Request(
+            f"{self.base}{path}",
+            json.dumps(body).encode() if body is not None else None,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.cfg["timeout"]) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            raise RuntimeError(f"OpenAI returned {e.code}: {detail}") from None
+
+    def complete(self, system: str, user: str) -> str:
+        data = self._request("/chat/completions", {
+            "model": self.cfg["model"],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        })
+        choice = data["choices"][0]
+        if choice.get("finish_reason") == "content_filter":
+            raise RuntimeError("OpenAI declined to process this recording.")
+        return (choice["message"].get("content") or "").strip()
+
+    def check(self) -> str:
+        self._request(f"/models/{self.cfg['model']}")
+        return f"ChatGPT {self.cfg['model']}: credentials OK"
+
+
 def make_backend(cfg: dict, name: str):
     if name == "local":
         return LocalBackend(cfg["local"])
     if name == "claude":
         return ClaudeBackend(cfg["claude"])
-    raise SystemExit(f"Unknown backend {name!r} (use 'local' or 'claude')")
+    if name == "chatgpt":
+        return ChatGPTBackend(cfg["chatgpt"])
+    raise SystemExit(f"Unknown provider {name!r} (use one of: {', '.join(PROVIDERS)})")
 
 
-def run_task(backend, transcript: str, instructions: str, title: str) -> str:
+def run_task(backend, transcript: str, instructions: str, title: str, log=log_stderr) -> str:
     header = f"Recording: {title}\n\n"
     limit = backend.max_input_tokens()
     if estimate_tokens(transcript) <= limit:
@@ -422,7 +503,7 @@ def run_task(backend, transcript: str, instructions: str, title: str) -> str:
     chunks = chunk_transcript(transcript, limit)
     partials = []
     for i, chunk in enumerate(chunks, 1):
-        print(f"  part {i}/{len(chunks)}…", file=sys.stderr)
+        log(f"  part {i}/{len(chunks)}…")
         partials.append(backend.complete(
             SYSTEM_PROMPT,
             f"{header}This is part {i} of {len(chunks)} of a long recording.\n<transcript>\n{chunk}\n</transcript>\n\n"
@@ -447,13 +528,13 @@ def slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-")[:60] or "recording"
 
 
-def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path) -> Path:
+def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr) -> Path:
     fid, title = rec_id(rec), rec.get("name") or rec_id(rec)
     transcript = fetch_transcript(plaud, fid)
     if not transcript.strip():
         raise NoTranscript("no transcript yet (transcribe it in the Plaud app); will retry next sync")
-    print(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}", file=sys.stderr)
-    body = run_task(backend, transcript, instructions, title)
+    log(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}")
+    body = run_task(backend, transcript, instructions, title, log)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md"
     path.write_text(
@@ -463,15 +544,53 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     return path
 
 
+def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path,
+                       log=log_stderr) -> Path | None:
+    """Process one recording and mark it done. Returns None when it has no transcript yet; raises on failure."""
+    try:
+        path = process(plaud, backend, rec, instructions, task, out_dir, log)
+    except NoTranscript as e:
+        log(f"– skipped {rec.get('name', rec_id(rec))}: {e}")
+        return None
+    state = load_state()
+    state["processed"][rec_id(rec)] = {"file": str(path), "backend": backend.name, "at": datetime.now().isoformat()}
+    save_state(state)
+    log(f"✓ {path.name}")
+    return path
+
+
+def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir: Path,
+         force: bool = False, log=log_stderr) -> tuple[list[Path], int]:
+    """Process every recording from the last `days` days not yet done. Returns (written notes, failure count)."""
+    since = (date.today() - timedelta(days=days)).isoformat()
+    done = load_state()["processed"]
+    targets = [r for r in list_recordings(plaud, since, None, None) if force or rec_id(r) not in done]
+    if not targets:
+        log("Nothing new to process.")
+    written, failures = [], 0
+    for rec in targets:
+        try:
+            path = process_and_record(plaud, backend, rec, instructions, task, out_dir, log)
+        except NotSignedIn:
+            raise
+        except Exception as e:
+            failures += 1
+            log(f"✗ {rec.get('name', rec_id(rec))}: {e}")
+            continue
+        if path:
+            written.append(path)
+    return written, failures
+
+
 # ---------------------------------------------------------------- CLI
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--backend", choices=["local", "claude"], help="override the backend in plaud_ai.toml")
+    ap.add_argument("--backend", choices=PROVIDERS, help="override the provider in plaud_ai.toml")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("login", help="sign in to Plaud (opens your browser)")
-    sub.add_parser("check", help="test the Plaud sign-in and both model backends")
+    sub.add_parser("check", help="test the Plaud sign-in and every model provider")
 
     p_list = sub.add_parser("list", help="list recent recordings")
     p_list.add_argument("--days", type=int, default=7)
@@ -491,7 +610,7 @@ def main() -> None:
     args = ap.parse_args()
     cfg = load_config()
     backend_name = args.backend or cfg["backend"]
-    out_dir = (HERE / cfg["output_dir"]).resolve()
+    out_dir = notes_dir(cfg)
 
     plaud = Plaud(Plaud.default_command(cfg))
     try:
@@ -505,7 +624,7 @@ def main() -> None:
                 print(f"Plaud: signed in as {user.get('email') or user.get('nickname') or 'OK'}")
             except Exception as e:
                 print(f"Plaud: {e}")
-            for name in ("local", "claude"):
+            for name in PROVIDERS:
                 try:
                     print(make_backend(cfg, name).check())
                 except Exception as e:
@@ -529,37 +648,20 @@ def main() -> None:
         backend = make_backend(cfg, backend_name)
         instructions = resolve_instructions(args.task, args.prompt)
         task_label = "custom" if args.prompt else args.task
-        state = load_state()
 
         if args.cmd == "process":
             rec = unwrap_file(plaud.call_json("get_file", file_id=args.file_id))
-            targets = [rec]
+            written = [p for p in [process_and_record(plaud, backend, rec, instructions, task_label, out_dir)] if p]
+            failures = 0
         else:
-            since = (date.today() - timedelta(days=args.days)).isoformat()
-            targets = [r for r in list_recordings(plaud, since, None, None)
-                       if args.force or rec_id(r) not in state["processed"]]
-            if not targets:
-                print("Nothing new to process.")
-                return
-
-        failures = 0
-        for rec in targets:
-            try:
-                path = process(plaud, backend, rec, instructions, task_label, out_dir)
-            except NoTranscript as e:
-                print(f"– skipped {rec.get('name', rec_id(rec))}: {e}", file=sys.stderr)
-                continue
-            except Exception as e:
-                failures += 1
-                print(f"✗ {rec.get('name', rec_id(rec))}: {e}", file=sys.stderr)
-                continue
-            state["processed"][rec_id(rec)] = {"file": str(path), "backend": backend.name, "at": datetime.now().isoformat()}
-            save_state(state)
-            print(f"✓ {path}")
-            if args.print:
+            written, failures = sync(plaud, backend, args.days, instructions, task_label, out_dir, args.force)
+        if args.print:
+            for path in written:
                 print(path.read_text())
         if failures:
             sys.exit(1)
+    except NotSignedIn:
+        sys.exit("Plaud: not signed in. Run: uv run plaud_ai.py login")
     except PlaudError as e:
         sys.exit(f"Plaud: {e}")
     finally:

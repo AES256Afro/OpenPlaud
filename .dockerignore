@@ -1,0 +1,8 @@
+node_modules
+notes
+.env
+.plaud_ai_state.json
+.git
+.claude
+__pycache__
+plaud_ai.toml

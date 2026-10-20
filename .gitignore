@@ -3,3 +3,4 @@ notes/
 .plaud_ai_state.json
 .env
 __pycache__/
+.claude/
