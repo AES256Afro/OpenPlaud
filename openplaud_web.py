@@ -440,7 +440,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
+        # Not no-referrer: under it browsers send "Origin: null" on every form post, same-site included.
+        self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -471,8 +472,14 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode()).items()}
 
     def _same_origin(self) -> bool:
+        site = self.headers.get("Sec-Fetch-Site")
+        if site:
+            return site in ("same-origin", "none")
         origin = self.headers.get("Origin")
-        return not origin or urllib.parse.urlsplit(origin).netloc == self.headers.get("Host")
+        if not origin:
+            return True
+        # Behind Tailscale Serve the Host header can be the backend's; the public name is forwarded.
+        return urllib.parse.urlsplit(origin).netloc in {self.headers.get("Host"), self.headers.get("X-Forwarded-Host")}
 
     def do_GET(self):
         url = urllib.parse.urlsplit(self.path)
