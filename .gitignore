@@ -1,0 +1,5 @@
+node_modules/
+notes/
+.plaud_ai_state.json
+.env
+__pycache__/

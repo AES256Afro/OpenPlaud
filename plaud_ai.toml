@@ -1,0 +1,23 @@
+# Which model processes your Plaud recordings by default: "local" or "claude".
+# Override per run with:  uv run plaud_ai.py --backend local sync
+backend = "claude"
+
+# Where the Markdown notes are written (relative to this folder).
+output_dir = "notes"
+
+[local]
+# "ollama" uses Ollama's native API so the context window can be sized to the transcript.
+# Use "openai" for LM Studio, llama.cpp, vLLM, or anything OpenAI-compatible
+# (e.g. base_url = "http://blackbox:1234/v1").
+kind = "ollama"
+base_url = "http://bigbox:11434"   # Tailscale MagicDNS name of the machine running the model
+model = "qwen3:30b-a3b"
+think = false                      # qwen3 reasoning mode: slower, sometimes better on long meetings
+max_context = 32768                # longer transcripts are summarized in parts, then combined
+timeout = 900                      # seconds per model call
+
+[claude]
+# Needs ANTHROPIC_API_KEY in your environment (or an `ant auth login` profile).
+model = "claude-haiku-5-5"         # or claude-sonnet-5-5 / claude-opus-5-5 for harder recordings
+effort = "medium"                  # low | medium | high | xhigh | max
+max_tokens = 32000

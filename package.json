@@ -1,0 +1,8 @@
+{
+  "name": "plaid-plaud-ai",
+  "private": true,
+  "description": "Local install of the Plaud MCP server used by plaud_ai.py",
+  "dependencies": {
+    "@plaud-ai/mcp": "0.3.14"
+  }
+}
