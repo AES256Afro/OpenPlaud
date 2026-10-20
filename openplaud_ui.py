@@ -177,6 +177,17 @@ def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
             f'<button class="btn{" small" if compact else ""}">{label}</button></form>')
 
 
+def claude_bits(ctx: dict, rec: dict) -> str:
+    """Where this recording stands with Claude: a link to its session, or a button to send it."""
+    if rec.get("claude_url"):
+        return f'<a class="btn small" href="{e(rec["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude ↗</a>'
+    if not ctx.get("claude_on"):
+        return ""
+    err = f'<span class="muted" style="font-size:12px" title="{e(rec["claude_error"])}">Claude: not sent ⓘ</span>' if rec.get("claude_error") else ""
+    return (f'{err}<form class="inline" method="post" action="/claude/send"><input type="hidden" name="id" value="{e(rec["id"])}">'
+            f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><button class="btn small">Send to Claude</button></form>')
+
+
 def move_form(ctx: dict, note_rel: str, current: str) -> str:
     choices = [f for f in [""] + ctx["folders"] if f != current]
     if not choices:
@@ -222,7 +233,8 @@ def account_bits(ctx: dict) -> str:
     signout = '<form class="inline" method="post" action="/plaud/signout"><button class="btn small">Sign out of Plaud</button></form>' if p["state"] == "signed_in" else ""
     test = f'<form class="inline" method="post" action="/test"><button class="btn small">Test {e(ctx["provider"])}</button></form>'
     logout = '<form class="inline" method="post" action="/logout"><button class="btn small">Lock</button></form>' if ctx["password"] else ""
-    return f'<div class="row" style="font-size:13px">{who}{signout}{test}{logout}</div>'
+    claude = f'<a class="btn small" href="/claude">Claude: {"on" if ctx.get("claude_on") else "set up"}</a>'
+    return f'<div class="row" style="font-size:13px">{who}{signout}{test}{claude}{logout}</div>'
 
 
 def activity(ctx: dict, title: str = "Activity", open_: bool = True) -> str:
@@ -240,7 +252,7 @@ def recordings_table(ctx: dict, compact: bool = False) -> str:
         return f'<p class="muted">No recordings in the last {ctx["list_days"]} days.</p>'
     rows = "".join(
         f'<tr><td class="mono" style="white-space:nowrap">{e(r["when_s"])}</td><td class="hide-sm">{e(r["duration"])}</td>'
-        f'<td>{open_link(ctx, r)}</td><td>{badge(r)}</td><td>{run_form(ctx, r, compact=True)}</td></tr>' for r in recs)
+        f'<td>{open_link(ctx, r)}</td><td>{badge(r)}</td><td><div class="row">{run_form(ctx, r, compact=True)}{claude_bits(ctx, r)}</div></td></tr>' for r in recs)
     return f'<div class="scroll"><table><tr><th>Recorded</th><th class="hide-sm">Length</th><th>Name</th><th>Status</th><th></th></tr>{rows}</table></div>'
 
 
@@ -375,7 +387,7 @@ def look_inbox(ctx):
 <div class="muted" style="margin-top:4px;font-size:14px">{e(r['summary'] or '')}</div>
 <div class="row" style="margin-top:8px">{badge(r)}<span class="muted" style="font-size:12px">{e(r['duration'])}</span>
 {f'<span class="badge warn">{r["actions_open"]} actions</span>' if r['actions_open'] else ''}</div>
-<div style="margin-top:8px">{run_form(ctx, r, compact=True)}</div></article>""")
+<div class="row" style="margin-top:8px">{run_form(ctx, r, compact=True)}{claude_bits(ctx, r)}</div></article>""")
     listing = "".join(cards) if ctx["recordings"] else f'<div style="padding:16px">{recordings_table(ctx)}</div>'
     n = ctx["note"]
     if n:
@@ -408,7 +420,7 @@ def look_timeline(ctx):
             blocks.append(f"""<article class="card"><div class="spread muted" style="font-size:13px"><span>{e(r['time_s'])} · {e(r['duration'])}</span>{badge(r)}</div>
 <h3>{e(r['name'])}</h3>{f'<p style="margin:0 0 12px">{e(r["summary"])}</p>' if r['summary'] else ''}
 <div class="row">{f'<a href="{e(r["note_url"])}" style="font-weight:600">Read notes</a>' if r['note_url'] else ''}
-{f'<span class="muted">{r["actions_open"]} open actions</span>' if r['actions_open'] else ''}<span style="margin-left:auto">{run_form(ctx, r, compact=True)}</span></div></article>""")
+{f'<span class="muted">{r["actions_open"]} open actions</span>' if r['actions_open'] else ''}<span class="row" style="margin-left:auto">{claude_bits(ctx, r)}{run_form(ctx, r, compact=True)}</span></div></article>""")
     feed = "".join(blocks) if ctx["recordings"] else recordings_table(ctx)
     open_count = sum(1 for a in ctx["actions"] if not a["done"])
     body = f"""<div class="tl"><div class="main"><div class="spread"><h1>Your recordings</h1><div class="row">{switcher(ctx)}{sync_button()}</div></div>
@@ -463,6 +475,11 @@ dialog li.hit a,dialog li.hit button{background:var(--panel2);box-shadow:inset 2
             cmds.append(f'<li data-k="open {e(r["name"].lower())}"><a href="{e(r["note_url"])}">Open notes: {e(r["name"])}</a></li>')
         cmds.append(f'<li data-k="run {e(r["name"].lower())}"><form method="post" action="/process"><input type="hidden" name="id" value="{e(r["id"])}">'
                     f'<input type="hidden" name="task" value="{e(ctx["default_task"])}"><button>Run: {e(r["name"])}</button></form></li>')
+        if r.get("claude_url"):
+            cmds.append(f'<li data-k="claude open {e(r["name"].lower())}"><a href="{e(r["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude: {e(r["name"])}</a></li>')
+        elif ctx.get("claude_on"):
+            cmds.append(f'<li data-k="claude send {e(r["name"].lower())}"><form method="post" action="/claude/send"><input type="hidden" name="id" value="{e(r["id"])}">'
+                        f'<button>Send to Claude: {e(r["name"])}</button></form></li>')
     for f in ctx["folders"]:
         cmds.append(f'<li data-k="go folder {e(f.lower())}"><a href="{e("/?" + urllib.parse.urlencode({"folder": f}) + "#notes")}">Go to folder: {e(f)}</a></li>')
     for k, v in LOOKS.items():
@@ -502,7 +519,8 @@ def look_board(ctx):
             elif r["status"] in ("ready", "filed") and r.get("note_rel"):
                 extra = move_form(ctx, r["note_rel"], r.get("note_folder", ""))
             cards.append(f'<div class="card"><div style="font-weight:700">{open_link(ctx, r)}</div><div class="muted" style="font-size:13px;margin:4px 0 8px">'
-                         f'{e(r["when_s"])} · {e(r["duration"])}{" · " + e(r["note_folder"]) if r.get("note_folder") else ""}</div>{extra}</div>')
+                         f'{e(r["when_s"])} · {e(r["duration"])}{" · " + e(r["note_folder"]) if r.get("note_folder") else ""}</div>{extra}'
+                         f'<div class="row" style="margin-top:6px">{claude_bits(ctx, r)}</div></div>')
         cols.append(f'<section class="col"><h2>{e(title)}<span class="muted">{len(recs)}</span></h2>{"".join(cards)}</section>')
     board = f'<div class="cols">{"".join(cols)}</div>' if ctx["recordings"] is not None else recordings_table(ctx)
     body = f"""<div class="bd"><div class="spread" style="margin-bottom:14px"><h1 style="margin:0;font-size:24px">Recordings pipeline</h1>
@@ -568,7 +586,7 @@ def look_calendar(ctx):
         cols.append(f'<div><div style="font-weight:600;padding:4px;color:var(--muted)">{e(d.strftime("%a %-d"))}</div><div class="day">{"".join(evs)}</div></div>')
     sel = next((r for r in ctx["recordings"] or [] if r["id"] == ctx["rec"]), None)
     detail = (f"""<div class="muted" style="font-size:13px">{e(sel['when_s'])} · {e(sel['duration'])}</div><h2 style="font-size:18px;margin:4px 0 10px">{e(sel['name'])}</h2>
-{badge(sel)}<p>{e(sel['summary'] or 'No notes yet.')}</p><div class="stack">{f'<a href="{e(sel["note_url"])}">Open notes</a>' if sel['note_url'] else ''}{run_form(ctx, sel)}
+{badge(sel)}<p>{e(sel['summary'] or 'No notes yet.')}</p><div class="stack">{f'<a href="{e(sel["note_url"])}">Open notes</a>' if sel['note_url'] else ''}{run_form(ctx, sel)}{claude_bits(ctx, sel)}
 {move_form(ctx, sel['note_rel'], sel.get('note_folder', '')) if sel.get('note_rel') else ''}</div>""") if sel else '<p class="muted">Pick a recording on the calendar to see it here.</p>'
     nav = lambda w, label: f'<a class="btn small" href="{e("/?" + urllib.parse.urlencode({"week": w}))}">{label}</a>'
     body = f"""<div class="cal"><div class="spread" style="margin-bottom:14px"><div class="row"><h1 style="margin:0;font-size:22px">{e(start.strftime('%b %-d'))} – {e((start + timedelta(days=6)).strftime('%b %-d'))}</h1>
@@ -587,7 +605,7 @@ def look_phone(ctx):
 .ph section{scroll-margin-top:12px} .ph h2{font-size:18px;margin:26px 0 12px}"""
     cards = "".join(f"""<article class="card"><div class="spread muted" style="font-size:13px"><span>{e(r['when_s'])} · {e(r['duration'])}</span>{badge(r)}</div>
 <div style="font-weight:600;font-size:17px;margin:4px 0">{open_link(ctx, r)}</div>{f'<div class="muted">{e(r["summary"])}</div>' if r['summary'] else ''}
-<div style="margin-top:10px">{run_form(ctx, r)}</div></article>""" for r in ctx["recordings"] or []) or recordings_table(ctx)
+<div class="row" style="margin-top:10px">{run_form(ctx, r)}{claude_bits(ctx, r)}</div></article>""" for r in ctx["recordings"] or []) or recordings_table(ctx)
     body = f"""<div class="ph"><div class="spread"><h1>Today</h1>{sync_button('Sync')}</div><p class="muted">{e(sync_text(ctx))}</p>
 <div class="row" style="margin-bottom:10px">{switcher(ctx)}</div>{flash(ctx)}{plaud_panel(ctx)}
 <section id="recordings">{cards}</section><section id="actions"><h2>Action items</h2><div class="card">{actions_list(ctx, limit=10)}</div></section>
@@ -633,6 +651,28 @@ def note_page(ctx: dict, note: dict, transcript: list[str] | None = None, with_t
 <div class="row"><a class="btn small" href="{e(note['url'])}?raw=1">Download Markdown</a>{move_form(ctx, note['rel'], note['folder'])}{switcher(ctx)}</div></div>
 {flash(ctx)}<div style="display:flex;flex-wrap:wrap;gap:20px"><div class="panel note" style="flex:999 1 520px;min-width:0">{note['html']}</div>{side}</div></div>"""
     return page(ctx, note["title"], body)
+
+
+def claude_page(ctx: dict) -> str:
+    if ctx["claude_on"]:
+        status = (f'<p><span class="badge ok">On</span> Recordings made after {e((ctx["since"] or "")[:16].replace("T", " "))} '
+                  f'are sent automatically once their notes are written. {ctx["sent"]} sent so far; '
+                  f'{ctx["fires_hour"]} of 30 sends used this hour.</p>')
+    else:
+        missing = [label for label, ok in (("the fire URL", ctx["url_ok"]), ("the token", ctx["token_set"])) if not ok]
+        status = f'<p><span class="badge none">Off</span> Add {" and ".join(missing)} in BoxPilot (OpenPlaud › Settings) to turn it on.</p>'
+    failures = "".join(f'<li><span class="mono">{e(rid)}</span>: {e(f["error"])}</li>' for rid, f in ctx["failed"].items())
+    body = f"""<div style="max-width:820px;margin:0 auto;padding:24px 20px 48px"><div class="spread"><a href="/">← OpenPlaud</a>{switcher(ctx)}</div>
+<h1>Send to Claude</h1>{flash(ctx)}{status}
+{f'<div class="panel"><strong>Not sent</strong><ul>{failures}</ul><p class="muted" style="font-size:13px;margin-bottom:0">Rate limits and overloads are retried on the next sync. Other errors wait for you: fix the setting, then use Send to Claude on the recording.</p></div>' if failures else ''}
+<h2>How it works</h2><p>Each new recording's notes and transcript start a session in a Claude <em>scheduled task</em> on your Claude account. The session appears with your other sessions at claude.ai/code and in the Claude app's Code tab, where you can read it and keep chatting. It uses your Claude subscription, not an API key.</p>
+<h2>Set it up once</h2><ol class="stack" style="padding-left:20px">
+<li>Open <a href="https://claude.ai/code/routines" target="_blank" rel="noopener noreferrer">claude.ai/code/routines</a> and create a new scheduled task. Paste the prompt below. Under Connectors, keep only what it needs (Plaud, if you added it).</li>
+<li>Add an <strong>API</strong> trigger, copy the <strong>Fire URL</strong>, click <strong>Generate token</strong> and copy the token (it is shown once).</li>
+<li>In BoxPilot, open OpenPlaud › Settings and paste them into <strong>Claude fire URL</strong> and <strong>Claude token</strong>.</li></ol>
+<div class="panel"><div class="spread"><strong>Prompt for the scheduled task</strong></div><pre class="log" style="max-height:none;margin-top:8px">{e(ctx['prompt'])}</pre></div>
+<p class="muted" style="font-size:13px">Claude allows 30 sends an hour per task. Long transcripts are cut to fit Claude's 65,536-character limit; the message says where, with the Plaud file ID. A send that times out is never repeated automatically, because every send starts a new session.</p></div>"""
+    return page(ctx, "Send to Claude", body)
 
 
 def login_page(ctx: dict, error: str = "") -> str:

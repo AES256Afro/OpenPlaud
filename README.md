@@ -16,7 +16,7 @@ a command-line script.
 docker run -d -p 8795:8795 -v openplaud:/data \
   --add-host host.docker.internal:host-gateway \
   -e OPENPLAUD_PASSWORD=choose-one -e ANTHROPIC_API_KEY=sk-ant-... \
-  ghcr.io/aes256afro/openplaud:0.3.0
+  ghcr.io/aes256afro/openplaud:0.4.0
 ```
 
 Open `http://<server>:8795`, sign in, then **Start Plaud sign-in**. Plaud's page sends your browser to a
@@ -39,6 +39,17 @@ After that, recordings sync on a schedule, and each one can also be run by hand.
 | `OPENPLAUD_SYNC_DAYS` | How far back each sync looks, in days | `7` |
 | `OPENPLAUD_PASSWORD` | Password for the web page; empty means no password | |
 | `OPENPLAUD_LOOK` | Default look: `inbox`, `timeline`, `actions`, `command`, `board`, `reader`, `library`, `calendar`, `phone` or `console`. Each browser can pick its own from the page. | `inbox` |
+
+| `CLAUDE_ROUTINE_URL` | Fire URL of a Claude scheduled task's API trigger (Send to Claude) | |
+| `CLAUDE_ROUTINE_TOKEN` | That trigger's token | |
+
+### Send to Claude
+
+With a Claude scheduled task's API trigger configured, each new recording's notes and transcript start their own
+session in your Claude account, visible at claude.ai/code and in the Claude app's Code tab. It runs on your Claude
+subscription (Pro, Max, Team or Enterprise). Set it up from the page's **Claude** button, which shows the prompt to
+paste into the task. Only recordings made after it is switched on are sent automatically; older ones have a
+**Send to Claude** button. Claude allows 30 sends an hour per task, and long transcripts are cut to 65,536 characters.
 
 ### Looks
 

@@ -1,4 +1,5 @@
-"""OpenPlaud web app: sign in to Plaud, see recordings, summarize them, read and organize the notes.
+"""OpenPlaud web app: sign in to Plaud, see recordings, summarize them, read and organize the notes,
+and (optionally) send each recording to Claude as its own session.
 
 Settings come from the environment (BoxPilot's app settings): see README.md for the list. The page is
 drawn by openplaud_ui in one of ten looks; OPENPLAUD_LOOK sets the default and each browser can pick its own.
@@ -6,22 +7,20 @@ drawn by openplaud_ui in one of ten looks; OPENPLAUD_LOOK sets the default and e
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import queue
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections import deque
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import claude_routine as cr
+import openplaud_core as core
 import openplaud_notes as nt
 import openplaud_ui as ui
 import plaud_ai as pa
@@ -33,143 +32,73 @@ SYNC_DAYS = int(os.environ.get("OPENPLAUD_SYNC_DAYS", "7") or 7)
 LIST_DAYS = int(os.environ.get("OPENPLAUD_LIST_DAYS", "30") or 30)
 DEFAULT_TASK = os.environ.get("OPENPLAUD_TASK", "summary")
 DEFAULT_LOOK = os.environ.get("OPENPLAUD_LOOK", "inbox")
+CLAUDE_URL = os.environ.get("CLAUDE_ROUTINE_URL", "")
+CLAUDE_TOKEN = os.environ.get("CLAUDE_ROUTINE_TOKEN", "")
 AUTH_URL_FILE = Path(os.environ.get("OPENPLAUD_AUTH_URL_FILE", "/tmp/openplaud-auth-url"))
-PLAUD_CALLBACK = "http://127.0.0.1:8199/auth/callback"
 COOKIE = "openplaud_session"
 LOOK_COOKIE = "openplaud_look"
 SESSION_DAYS = 30
 PROVIDER_LABELS = {"claude": "Claude", "chatgpt": "ChatGPT", "local": "Local model"}
 TASK_LABELS = {"summary": "Meeting notes", "actions": "Action items", "followup": "Follow-up email"}
 
+plaud = core.PlaudSession(LIST_DAYS)
+signin = core.PlaudSignIn(plaud, AUTH_URL_FILE)
+passwords = core.Passwords(PASSWORD, b"openplaud-session:", SESSION_DAYS)
+
 
 def now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-# ---------------------------------------------------------------- Plaud session
-
-class PlaudSession:
-    """One Plaud MCP process shared by every request, used by one caller at a time."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self._plaud: pa.Plaud | None = None
-        self._user: tuple[float, str | None] = (0.0, None)
-        self._recordings: tuple[float, list[dict]] = (0.0, [])
-
-    def get(self) -> pa.Plaud:
-        if self._plaud is None or not self._plaud.alive():
-            self._plaud = pa.Plaud(pa.Plaud.default_command(pa.load_config()))
-        return self._plaud
-
-    def forget(self) -> None:
-        self._user = (0.0, None)
-        self._recordings = (0.0, [])
-
-    def user(self) -> str | None:
-        """Who is signed in (cached), or None. Raises TimeoutError while another caller holds the session."""
-        stamp, who = self._user
-        if time.time() - stamp < 300:
-            return who
-        if not self.lock.acquire(timeout=5):
-            raise TimeoutError
-        try:
-            info = json.loads(self.get().call("get_current_user"))
-            who = info.get("email") or info.get("nickname") or "your Plaud account"
-        except pa.PlaudError:
-            who = None
-        finally:
-            self.lock.release()
-        self._user = (time.time(), who)
-        return who
-
-    def recordings(self) -> list[dict]:
-        stamp, recs = self._recordings
-        if time.time() - stamp < 60:
-            return recs
-        if not self.lock.acquire(timeout=5):
-            raise TimeoutError
-        try:
-            since = (date.today() - timedelta(days=LIST_DAYS)).isoformat()
-            recs = pa.list_recordings(self.get(), since, None, None)
-        finally:
-            self.lock.release()
-        recs.sort(key=lambda r: pa.recorded_at(r) or datetime.min, reverse=True)
-        self._recordings = (time.time(), recs)
-        return recs
-
-    def transcript(self, file_id: str) -> list[str] | None:
-        if not self.lock.acquire(timeout=5):
-            return None
-        try:
-            text = pa.fetch_transcript(self.get(), file_id)
-            return text.splitlines() if text else []
-        except pa.PlaudError:
-            return None
-        finally:
-            self.lock.release()
+def claude_on() -> bool:
+    return cr.configured(CLAUDE_URL, CLAUDE_TOKEN)
 
 
-plaud = PlaudSession()
+# ---------------------------------------------------------------- sending to Claude
+
+def claude_state(state: dict) -> dict:
+    c = state.setdefault("claude", {})
+    c.setdefault("sent", {})
+    c.setdefault("failed", {})
+    c.setdefault("fires", [])
+    return c
 
 
-# ---------------------------------------------------------------- sign-in to Plaud (headless OAuth)
-
-class PlaudSignIn:
-    """Runs Plaud's `login` tool, captures the sign-in link it tries to open, and completes the
-    callback from inside the container with the address the owner pastes back."""
-
-    def __init__(self):
-        self.state = {"status": "idle", "url": None, "message": None}
-        self.thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self.thread and self.thread.is_alive():
+def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: bool = False) -> None:
+    """Fire the scheduled task with this recording's note and transcript. Automatic sends cover only
+    recordings made after sending was switched on, each once; a manual send always goes."""
+    if not claude_on():
+        return
+    rid = pa.rec_id(rec)
+    state = pa.load_state()
+    c = claude_state(state)
+    if not manual:
+        since = datetime.fromisoformat(c["since"]) if c.get("since") else None
+        when = pa.recorded_at(rec)
+        if rid in c["sent"] or (since and when and when < since):
             return
-        AUTH_URL_FILE.unlink(missing_ok=True)
-        self.state = {"status": "starting", "url": None, "message": None}
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-        for _ in range(60):
-            if AUTH_URL_FILE.exists() and AUTH_URL_FILE.read_text().strip():
-                self.state.update(status="waiting", url=AUTH_URL_FILE.read_text().strip())
-                return
-            if self.state["status"] in ("success", "failed"):
-                return
-            time.sleep(0.25)
-        if self.state["status"] == "starting":
-            self.state.update(status="failed", message="Plaud didn't produce a sign-in link. Try again.")
-
-    def _run(self) -> None:
-        with plaud.lock:
-            try:
-                text = plaud.get().call("login")
-                ok = "Successfully" in text or "Already logged in" in text
-                self.state.update(status="success" if ok else "failed", message=text)
-            except pa.PlaudError as err:
-                self.state.update(status="failed", message=str(err).split("\n")[0])
-        plaud.forget()
-
-    def complete(self, pasted: str) -> None:
-        query = urllib.parse.urlsplit(pasted.strip()).query or pasted.strip().lstrip("?")
-        params = urllib.parse.parse_qs(query)
-        if "code" not in params or "state" not in params:
-            self.state["message"] = "That address has no sign-in code in it. Paste the full address from the browser's address bar."
-            return
-        if self.state["status"] != "waiting":
-            self.state["message"] = "The sign-in expired (Plaud allows 2 minutes). Start again."
-            return
-        try:
-            with urllib.request.urlopen(f"{PLAUD_CALLBACK}?{query}", timeout=30):
-                pass
-        except urllib.error.URLError as err:
-            self.state["message"] = f"Couldn't finish the sign-in: {err}"
-            return
-        if self.thread:
-            self.thread.join(timeout=30)
-
-
-signin = PlaudSignIn()
+    budget = cr.FireBudget([float(s) for s in c["fires"]])
+    if not budget.available():
+        c["failed"][rid] = {"error": "Waiting: Claude's hourly limit for this task is nearly used. Sent on a later sync.",
+                            "retryable": True, "at": datetime.now().isoformat()}
+        pa.save_state(state)
+        log(f"… Claude: hourly limit near, {rec.get('name', rid)} waits for the next sync")
+        return
+    text = cr.build_payload(rec.get("name") or rid, pa.recorded_at(rec).strftime("%Y-%m-%d %H:%M") if pa.recorded_at(rec) else "?",
+                            pa.duration(rec), rid, [("Notes written by OpenPlaud", note_path.read_text())], transcript)
+    budget.spend()
+    c["fires"] = budget.stamps
+    try:
+        result = cr.fire(CLAUDE_URL, CLAUDE_TOKEN, text)
+    except cr.RoutineError as err:
+        c["failed"][rid] = {"error": str(err), "retryable": err.retryable, "at": datetime.now().isoformat()}
+        pa.save_state(state)
+        log(f"✗ Claude: {rec.get('name', rid)}: {err}")
+        return
+    c["sent"][rid] = {"session_url": result["session_url"], "at": datetime.now().isoformat(), "note": str(note_path)}
+    c["failed"].pop(rid, None)
+    pa.save_state(state)
+    log(f"→ Claude: {rec.get('name', rid)} · {result['session_url']}")
 
 
 # ---------------------------------------------------------------- background jobs
@@ -198,7 +127,7 @@ class Jobs:
         return True
 
     def queued_ids(self) -> set[str]:
-        return {job[1] for job in self.pending if job[0] == "process"}
+        return {job[1] for job in self.pending if job[0] in ("process", "claude")}
 
     def _scheduler(self) -> None:
         self.next_sync = datetime.now() + timedelta(seconds=30)
@@ -211,8 +140,8 @@ class Jobs:
     def _worker(self) -> None:
         while True:
             job = self.queue.get()
-            self.current = "Syncing new recordings" if job[0] == "sync" else "Summarizing a recording"
-            self.active_id = job[1] if job[0] == "process" else None
+            self.current = {"sync": "Syncing new recordings", "process": "Summarizing a recording", "claude": "Sending to Claude"}[job[0]]
+            self.active_id = job[1] if job[0] != "sync" else None
             try:
                 self._run(job)
             except pa.NotSignedIn:
@@ -225,6 +154,9 @@ class Jobs:
                 self.active_id = None
                 plaud.forget()
 
+    def _on_done(self, manual: bool = False):
+        return lambda rec, path, transcript: send_to_claude(rec, path, transcript, self.say, manual=manual)
+
     def _run(self, job: tuple) -> None:
         cfg = pa.load_config()
         backend = pa.make_backend(cfg, cfg["backend"])
@@ -233,35 +165,41 @@ class Jobs:
             p = plaud.get()
             if job[0] == "sync":
                 self.say(f"Sync started (last {SYNC_DAYS} days, {backend.name})")
-                written, failures = pa.sync(p, backend, SYNC_DAYS, pa.TASKS[DEFAULT_TASK], DEFAULT_TASK, out_dir,
-                                            log=self.say, on_start=lambda rec: setattr(self, "active_id", pa.rec_id(rec)))
+                written, failures = pa.sync(p, backend, SYNC_DAYS, pa.TASKS[DEFAULT_TASK], DEFAULT_TASK, out_dir, log=self.say,
+                                            on_start=lambda rec: setattr(self, "active_id", pa.rec_id(rec)), on_done=self._on_done())
                 self.last_sync = datetime.now().strftime("%-d %b %H:%M")
                 self.say(f"Sync finished: {len(written)} new, {failures} failed")
-            else:
+                self._retry_claude(p, out_dir)
+            elif job[0] == "process":
                 _, file_id, task = job
                 rec = pa.unwrap_file(p.call_json("get_file", file_id=file_id))
-                pa.process_and_record(p, backend, rec, pa.TASKS[task], task, out_dir, log=self.say)
+                pa.process_and_record(p, backend, rec, pa.TASKS[task], task, out_dir, log=self.say, on_done=self._on_done())
+            else:
+                _, file_id = job
+                rec = pa.unwrap_file(p.call_json("get_file", file_id=file_id))
+                note = nt.note_for(out_dir, pa.load_state()["processed"].get(file_id))
+                if note:
+                    send_to_claude(rec, note, pa.fetch_transcript(p, file_id), self.say, manual=True)
+                else:
+                    pa.process_and_record(p, backend, rec, pa.TASKS[DEFAULT_TASK], DEFAULT_TASK, out_dir, log=self.say,
+                                          on_done=self._on_done(manual=True))
+
+    def _retry_claude(self, p: pa.Plaud, out_dir: Path) -> None:
+        """Send again what Claude refused with a rate limit or overload; errors that need the owner wait for them."""
+        if not claude_on():
+            return
+        state = pa.load_state()
+        for rid, failure in list(claude_state(state)["failed"].items()):
+            if not failure.get("retryable"):
+                continue
+            note = nt.note_for(out_dir, state["processed"].get(rid))
+            if not note:
+                continue
+            rec = pa.unwrap_file(p.call_json("get_file", file_id=rid))
+            send_to_claude(rec, note, pa.fetch_transcript(p, rid), self.say, manual=True)
 
 
 jobs = Jobs()
-
-
-# ---------------------------------------------------------------- sessions (the page's own password)
-
-def _session_key() -> bytes:
-    return hashlib.sha256(b"openplaud-session:" + PASSWORD.encode()).digest()
-
-
-def make_session() -> str:
-    expires = str(int(time.time()) + SESSION_DAYS * 86400)
-    return f"{expires}.{hmac.new(_session_key(), expires.encode(), 'sha256').hexdigest()}"
-
-
-def valid_session(token: str) -> bool:
-    expires, _, mac = token.partition(".")
-    if not expires.isdigit() or int(expires) < time.time():
-        return False
-    return hmac.compare_digest(mac, hmac.new(_session_key(), expires.encode(), "sha256").hexdigest())
 
 
 # ---------------------------------------------------------------- what a page shows
@@ -283,23 +221,10 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
     cfg = pa.load_config()
     root = pa.notes_dir(cfg)
     root.mkdir(parents=True, exist_ok=True)
-    folder_param = query.get("folder", "")
-    here_dir = nt.inside(root, folder_param)
+    here_dir = nt.inside(root, query.get("folder", ""))
     here_dir = here_dir if here_dir and here_dir.is_dir() else root
     folder = nt.rel_of(root, here_dir) if here_dir != root else ""
-
-    st = signin.state
-    plaud_state = {"state": "signed_out", "who": None, "url": st.get("url"), "message": st.get("message"), "failed": st["status"] == "failed"}
-    if st["status"] in ("starting", "waiting"):
-        plaud_state["state"] = "waiting" if st.get("url") else "busy"
-    else:
-        try:
-            who = plaud.user()
-            if who:
-                plaud_state.update(state="signed_in", who=who)
-        except TimeoutError:
-            plaud_state["state"] = "busy" if not plaud._user[1] else "signed_in"
-            plaud_state["who"] = plaud._user[1]
+    plaud_state = signin.page_state()
 
     # Every note once: titles, summaries and action items for the looks that show them.
     notes = []
@@ -315,6 +240,8 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
     by_path = {n["path"].resolve(): n for n in notes}
 
     state = pa.load_state()
+    sent = claude_state(state)["sent"]
+    failed = claude_state(state)["failed"]
     recordings, recordings_error = None, None
     if plaud_state["state"] == "signed_in":
         try:
@@ -342,7 +269,8 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
                     "duration": pa.duration(r), "status": status,
                     "note_url": note["url"] if note else None, "note_rel": note["rel"] if note else None,
                     "note_folder": note["folder"] if note else "", "summary": note["summary"] if note else "",
-                    "actions_open": sum(1 for a in note["actions"] if not a["done"]) if note else 0})
+                    "actions_open": sum(1 for a in note["actions"] if not a["done"]) if note else 0,
+                    "claude_url": sent.get(rid, {}).get("session_url"), "claude_error": failed.get(rid, {}).get("error")})
         except TimeoutError:
             recordings_error = "Plaud is busy with a sync. The list refreshes when it's done."
         except pa.PlaudError as err:
@@ -386,13 +314,22 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         "sync_every": SYNC_EVERY_MIN, "sync_days": SYNC_DAYS, "list_days": LIST_DAYS,
         "last_sync": jobs.last_sync, "next_sync": jobs.next_sync.strftime("%-I:%M %p") if jobs.next_sync else None,
         "busy": bool(jobs.current) or not jobs.queue.empty(), "current": jobs.current, "log": list(jobs.log)[-200:],
-        "password": bool(PASSWORD), "plaud": plaud_state,
+        "password": bool(PASSWORD), "plaud": plaud_state, "claude_on": claude_on(),
         "recordings": recordings, "recordings_error": recordings_error,
         "folders": folders, "folder_counts": folder_counts, "subfolders": subfolders, "breadcrumbs": crumbs,
         "notes_here": [n for n in notes if n["folder"] == folder], "recent_notes": notes,
         "actions": actions, "counts": {"notes": len(notes)},
         "tasks": TASK_LABELS, "default_task": DEFAULT_TASK, "note": selected, "transcript": transcript,
     }
+
+
+def claude_context(look: str, flash: str | None) -> dict:
+    state = pa.load_state()
+    c = claude_state(state)
+    return {"look": look, "flash": flash, "here": "/claude", "folder": "", "folders": [], "claude_on": claude_on(),
+            "since": c.get("since"), "sent": len(c["sent"]), "failed": c["failed"],
+            "fires_hour": len([s for s in c["fires"] if float(s) > time.time() - 3600]), "prompt": cr.SUGGESTED_PROMPT,
+            "url_ok": bool(CLAUDE_URL) and cr.configured(CLAUDE_URL, "x"), "token_set": bool(CLAUDE_TOKEN.strip())}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -403,15 +340,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _cookie(self, name: str) -> str | None:
-        for part in self.headers.get("Cookie", "").split(";"):
-            key, _, value = part.strip().partition("=")
-            if key == name:
-                return value
-        return None
-
     def _look(self) -> str:
-        chosen = self._cookie(LOOK_COOKIE)
+        chosen = core.cookie(self.headers, LOOK_COOKIE)
         if chosen in ui.LOOKS:
             return chosen
         return DEFAULT_LOOK if DEFAULT_LOOK in ui.LOOKS else "inbox"
@@ -445,21 +375,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _authed(self) -> bool:
-        return not PASSWORD or valid_session(self._cookie(COOKIE) or "")
+        return passwords.valid(core.cookie(self.headers, COOKIE) or "")
 
     def _form(self) -> dict:
         length = min(int(self.headers.get("Content-Length") or 0), 16384)
         return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode()).items()}
-
-    def _same_origin(self) -> bool:
-        site = self.headers.get("Sec-Fetch-Site")
-        if site:
-            return site in ("same-origin", "none")
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        # Behind Tailscale Serve the Host header can be the backend's; the public name is forwarded.
-        return urllib.parse.urlsplit(origin).netloc in {self.headers.get("Host"), self.headers.get("X-Forwarded-Host")}
 
     def _bare_ctx(self) -> dict:
         return {"look": self._look(), "flash": None, "here": "/", "folder": "", "folders": []}
@@ -474,8 +394,9 @@ class Handler(BaseHTTPRequestHandler):
         query = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         here = url.path + ("?" + urllib.parse.urlencode({k: v for k, v in query.items() if k != "msg"}) if any(k != "msg" for k in query) else "")
         if path == "/":
-            ctx = build_context(self._look(), query, query.get("msg"), here)
-            return self._send(200, ui.dashboard(ctx))
+            return self._send(200, ui.dashboard(build_context(self._look(), query, query.get("msg"), here)))
+        if path == "/claude":
+            return self._send(200, ui.claude_page(claude_context(self._look(), query.get("msg"))))
         if path == "/api/status":
             body = {"busy": bool(jobs.current) or not jobs.queue.empty(), "current": jobs.current,
                     "log": list(jobs.log)[-80:], "signin": signin.state["status"]}
@@ -485,8 +406,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, ui.page(self._bare_ctx(), "Not found", '<p style="padding:20px">Not found. <a href="/">Back</a></p>'))
 
     def _note(self, rel: str, raw: bool, flash: str | None, here: str):
-        cfg = pa.load_config()
-        root = pa.notes_dir(cfg)
+        root = pa.notes_dir(pa.load_config())
         target = nt.inside(root, rel)
         if not target or target.suffix != ".md" or not target.is_file():
             return self._send(404, ui.page(self._bare_ctx(), "Not found", '<p style="padding:20px">No such note. <a href="/#notes">Back</a></p>'))
@@ -504,15 +424,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path.rstrip("/")
-        if not self._same_origin():
+        if not core.same_origin(self.headers):
             return self._send(403, "Cross-site request refused.", "text/plain")
         form = self._form()
-        back = form.get("back", "/")
-        back = back if back.startswith("/") and not back.startswith("//") else "/"
+        back = core.safe_back(form.get("back", "/"))
         if path == "/login":
-            if PASSWORD and hmac.compare_digest(form.get("password", "").encode(), PASSWORD.encode()):
+            if passwords.check(form.get("password", "")):
                 secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-                cookie = f"{COOKIE}={make_session()}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_DAYS * 86400}{secure}"
+                cookie = f"{COOKIE}={passwords.make()}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_DAYS * 86400}{secure}"
                 return self._redirect("/", headers={"Set-Cookie": cookie})
             time.sleep(1)
             return self._send(401, ui.login_page(self._bare_ctx(), "Wrong password."))
@@ -524,8 +443,7 @@ class Handler(BaseHTTPRequestHandler):
             look = form.get("look", "")
             if look not in ui.LOOKS:
                 return self._redirect(back, "Unknown look.")
-            cookie = f"{LOOK_COOKIE}={look}; Path=/; SameSite=Strict; Max-Age={365 * 86400}"
-            return self._redirect(back, headers={"Set-Cookie": cookie})
+            return self._redirect(back, headers={"Set-Cookie": f"{LOOK_COOKIE}={look}; Path=/; SameSite=Strict; Max-Age={365 * 86400}"})
         if path == "/plaud/signin":
             signin.start()
             return self._redirect("/", signin.state.get("message") if signin.state["status"] == "failed" else None)
@@ -534,13 +452,7 @@ class Handler(BaseHTTPRequestHandler):
             ok = signin.state["status"] == "success"
             return self._redirect("/", "Signed in to Plaud." if ok else signin.state.get("message") or "Sign-in didn't finish.")
         if path == "/plaud/signout":
-            with plaud.lock:
-                try:
-                    plaud.get().call("logout")
-                except pa.PlaudError:
-                    pass
-            plaud.forget()
-            signin.state = {"status": "idle", "url": None, "message": None}
+            signin.sign_out()
             return self._redirect("/", "Signed out of Plaud.")
         if path == "/folders":
             root = pa.notes_dir(pa.load_config())
@@ -564,10 +476,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/sync":
             added = jobs.add(("sync",))
             return self._redirect(back, "Sync queued." if added else "A sync is already queued.")
-        if path == "/process":
+        if path in ("/process", "/claude/send"):
             file_id, task = form.get("id", ""), form.get("task", DEFAULT_TASK)
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", file_id) or task not in pa.TASKS:
                 return self._redirect(back, "Unknown recording or task.")
+            if path == "/claude/send":
+                if not claude_on():
+                    return self._redirect("/claude", "Set the Claude fire URL and token in BoxPilot first.")
+                jobs.add(("claude", file_id))
+                return self._redirect(back, "Sending to Claude.")
             jobs.add(("process", file_id, task))
             return self._redirect(back, "Queued.")
         if path == "/test":
@@ -589,8 +506,17 @@ def main() -> None:
     if DEFAULT_LOOK not in ui.LOOKS:
         raise SystemExit(f"OPENPLAUD_LOOK must be one of {', '.join(ui.LOOKS)}")
     pa.notes_dir(cfg).mkdir(parents=True, exist_ok=True)
+    if claude_on():
+        state = pa.load_state()
+        c = claude_state(state)
+        if not c.get("since"):
+            c["since"] = datetime.now().isoformat()
+            pa.save_state(state)
+    elif CLAUDE_URL or CLAUDE_TOKEN:
+        print("Send to Claude is off: the fire URL or token is missing or malformed.", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"OpenPlaud listening on :{PORT} ({model_label(cfg)}, look: {DEFAULT_LOOK})", flush=True)
+    print(f"OpenPlaud listening on :{PORT} ({model_label(cfg)}, look: {DEFAULT_LOOK}, "
+          f"send to Claude: {'on' if claude_on() else 'off'})", flush=True)
     server.serve_forever()
 
 

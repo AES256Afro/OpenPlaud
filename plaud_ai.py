@@ -540,7 +540,8 @@ def unique_path(path: Path) -> Path:
         n += 1
 
 
-def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr) -> Path:
+def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr,
+            on_done=None) -> Path:
     fid, title = rec_id(rec), rec.get("name") or rec_id(rec)
     transcript = fetch_transcript(plaud, fid)
     if not transcript.strip():
@@ -553,14 +554,19 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
         f"# {title}\n\n- Date: {recording_date(rec)}\n- Duration: {duration(rec)}\n- Plaud file ID: `{fid}`\n"
         f"- Processed by: {backend.name} on {datetime.now():%Y-%m-%d %H:%M}\n\n{body}\n"
     )
+    if on_done:
+        on_done(rec, path, transcript)
     return path
 
 
 def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path,
-                       log=log_stderr) -> Path | None:
-    """Process one recording and mark it done. Returns None when it has no transcript yet; raises on failure."""
+                       log=log_stderr, on_done=None) -> Path | None:
+    """Process one recording and mark it done. Returns None when it has no transcript yet; raises on failure.
+    `on_done(rec, note_path, transcript)` runs after the note is written and recorded."""
+    done: list = []
     try:
-        path = process(plaud, backend, rec, instructions, task, out_dir, log)
+        path = process(plaud, backend, rec, instructions, task, out_dir, log,
+                       on_done=lambda *args: done.append(args) if on_done else None)
     except NoTranscript as e:
         log(f"– skipped {rec.get('name', rec_id(rec))}: {e}")
         state = load_state()
@@ -572,11 +578,13 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
     state.setdefault("no_transcript", {}).pop(rec_id(rec), None)
     save_state(state)
     log(f"✓ {path.name}")
+    if on_done and done:
+        on_done(*done[0])
     return path
 
 
 def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir: Path,
-         force: bool = False, log=log_stderr, on_start=None) -> tuple[list[Path], int]:
+         force: bool = False, log=log_stderr, on_start=None, on_done=None) -> tuple[list[Path], int]:
     """Process every recording from the last `days` days not yet done. Returns (written notes, failure count)."""
     since = (date.today() - timedelta(days=days)).isoformat()
     done = load_state()["processed"]
@@ -588,7 +596,7 @@ def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir
         if on_start:
             on_start(rec)
         try:
-            path = process_and_record(plaud, backend, rec, instructions, task, out_dir, log)
+            path = process_and_record(plaud, backend, rec, instructions, task, out_dir, log, on_done=on_done)
         except NotSignedIn:
             raise
         except Exception as e:
