@@ -563,16 +563,20 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
         path = process(plaud, backend, rec, instructions, task, out_dir, log)
     except NoTranscript as e:
         log(f"– skipped {rec.get('name', rec_id(rec))}: {e}")
+        state = load_state()
+        state.setdefault("no_transcript", {})[rec_id(rec)] = datetime.now().isoformat()
+        save_state(state)
         return None
     state = load_state()
     state["processed"][rec_id(rec)] = {"file": str(path), "backend": backend.name, "at": datetime.now().isoformat()}
+    state.setdefault("no_transcript", {}).pop(rec_id(rec), None)
     save_state(state)
     log(f"✓ {path.name}")
     return path
 
 
 def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir: Path,
-         force: bool = False, log=log_stderr) -> tuple[list[Path], int]:
+         force: bool = False, log=log_stderr, on_start=None) -> tuple[list[Path], int]:
     """Process every recording from the last `days` days not yet done. Returns (written notes, failure count)."""
     since = (date.today() - timedelta(days=days)).isoformat()
     done = load_state()["processed"]
@@ -581,6 +585,8 @@ def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir
         log("Nothing new to process.")
     written, failures = [], 0
     for rec in targets:
+        if on_start:
+            on_start(rec)
         try:
             path = process_and_record(plaud, backend, rec, instructions, task, out_dir, log)
         except NotSignedIn:

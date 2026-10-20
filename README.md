@@ -16,7 +16,7 @@ a command-line script.
 docker run -d -p 8795:8795 -v openplaud:/data \
   --add-host host.docker.internal:host-gateway \
   -e OPENPLAUD_PASSWORD=choose-one -e ANTHROPIC_API_KEY=sk-ant-... \
-  ghcr.io/aes256afro/openplaud:0.2.0
+  ghcr.io/aes256afro/openplaud:0.3.0
 ```
 
 Open `http://<server>:8795`, sign in, then **Start Plaud sign-in**. Plaud's page sends your browser to a
@@ -38,6 +38,21 @@ After that, recordings sync on a schedule, and each one can also be run by hand.
 | `OPENPLAUD_SYNC_EVERY` | Minutes between automatic syncs; `0` turns it off | `60` |
 | `OPENPLAUD_SYNC_DAYS` | How far back each sync looks, in days | `7` |
 | `OPENPLAUD_PASSWORD` | Password for the web page; empty means no password | |
+| `OPENPLAUD_LOOK` | Default look: `inbox`, `timeline`, `actions`, `command`, `board`, `reader`, `library`, `calendar`, `phone` or `console`. Each browser can pick its own from the page. | `inbox` |
+
+### Looks
+
+The page comes in ten looks that show the same recordings, notes and actions in different layouts:
+**Inbox** (folders, list and reader), **Timeline** (a day-by-day feed), **Action Center** (action items from every
+note), **Command** (a keyboard palette on ⌘K / Ctrl-K), **Pipeline board** (columns from new to filed),
+**Reader** (notes beside the transcript), **Library** (folder tiles), **Calendar** (a week view), **Phone**
+(one column with a tab bar) and **Console** (sync and status tiles). The look menu at the top of the page switches
+it for that browser; `OPENPLAUD_LOOK` sets the default for everyone else.
+
+### Notes are never deleted
+
+OpenPlaud has no delete. Running a recording again, or moving a note into a folder that already holds that
+name, writes `name-2.md` beside the original. Folders organize notes in `/data/notes`.
 
 Notes, the Plaud sign-in and the record of processed recordings live in `/data`.
 

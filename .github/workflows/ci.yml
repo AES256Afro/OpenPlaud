@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Syntax
-        run: python3 -m py_compile plaud_ai.py openplaud_web.py
+        run: python3 -m py_compile plaud_ai.py openplaud_web.py openplaud_notes.py openplaud_ui.py
       - name: Image builds
         run: docker build -t openplaud:ci .
       - name: Container serves its health check

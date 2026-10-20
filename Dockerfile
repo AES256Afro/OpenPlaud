@@ -17,7 +17,7 @@ COPY docker/capture-url.sh /app/node_modules/open/xdg-open
 COPY docker/capture-url.sh /usr/local/bin/xdg-open
 RUN chmod 755 /app/node_modules/open/xdg-open /usr/local/bin/xdg-open
 
-COPY plaud_ai.py openplaud_web.py ./
+COPY plaud_ai.py openplaud_web.py openplaud_notes.py openplaud_ui.py ./
 
 ENV HOME=/data \
     OPENPLAUD_DATA=/data \
