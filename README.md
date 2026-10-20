@@ -16,7 +16,7 @@ a command-line script.
 docker run -d -p 8795:8795 -v openplaud:/data \
   --add-host host.docker.internal:host-gateway \
   -e OPENPLAUD_PASSWORD=choose-one -e ANTHROPIC_API_KEY=sk-ant-... \
-  ghcr.io/aes256afro/openplaud:0.1.0
+  ghcr.io/aes256afro/openplaud:0.2.0
 ```
 
 Open `http://<server>:8795`, sign in, then **Start Plaud sign-in**. Plaud's page sends your browser to a
