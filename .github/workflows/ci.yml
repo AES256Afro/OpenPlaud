@@ -21,8 +21,13 @@ jobs:
       - name: Container serves its health check
         run: |
           docker run -d --name op -p 8795:8795 -e OPENPLAUD_SYNC_EVERY=0 openplaud:ci
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8795/healthz && exit 0; sleep 1; done
-          docker logs op; exit 1
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8795/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8795/healthz || { docker logs op; exit 1; }
+      - name: Every look renders
+        run: |
+          for look in inbox timeline actions command board reader library calendar phone console; do
+            curl -fsS -o /dev/null -b "openplaud_look=$look" http://127.0.0.1:8795/ || { echo "look $look failed"; docker logs op; exit 1; }
+          done
 
   image:
     if: startsWith(github.ref, 'refs/tags/v')
