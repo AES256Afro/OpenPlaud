@@ -818,7 +818,7 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     fid, title = rec_id(rec), rec.get("name") or rec_id(rec)
     transcript = fetch_transcript(plaud, fid)
     if not transcript.strip():
-        raise NoTranscript("no transcript yet (transcribe it in the Plaud app); will retry next sync")
+        raise NoTranscript("no transcript yet (transcribe it in the Plaud app); checked again next time")
     save_transcript(fid, transcript)
     transcript = apply_speakers(transcript, load_state().get("speakers", {}).get(fid))
     cap = float(os.environ.get("OPENPLAUD_MONTHLY_CAP", "0") or 0)

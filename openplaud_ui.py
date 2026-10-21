@@ -804,7 +804,7 @@ def look_console(ctx):
 <div class="tiles"><div class="tile"><span class="muted" style="font-size:12px">Plaud</span><b style="color:{'var(--ok-ink)' if p['state'] == 'signed_in' else 'var(--bad-ink)'}">{'Signed in' if p['state'] == 'signed_in' else 'Not signed in'}</b></div>
 <div class="tile"><span class="muted" style="font-size:12px">Next check</span><b>{e(ctx['next_sync'] or ('off' if not ctx['sync_every'] else 'soon'))}</b><span class="muted" style="font-size:12px">{f"every {ctx['sync_every']} min · last {ctx['sync_days']} days" if ctx['sync_every'] else 'automatic checks are off'}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Working on</span><b>{queue_n} recordings</b><span class="muted" style="font-size:12px">{e(ctx['current'] or 'idle')}</span></div>
-<div class="tile"><span class="muted" style="font-size:12px">Waiting on Plaud</span><b>{waiting} recordings</b><span class="muted" style="font-size:12px">no transcript yet · retried each sync</span></div></div>
+<div class="tile"><span class="muted" style="font-size:12px">Waiting on Plaud</span><b>{waiting} recordings</b><span class="muted" style="font-size:12px">no transcript yet · checked again each time</span></div></div>
 <p class="muted" style="font-size:13px;margin:-6px 0 14px">This month on paid models: ${ctx.get('spend', 0):.2f}{(" of $" + format(ctx['cap'], '.2f') + " cap") if ctx.get('cap') else " (no cap)"}{(" · " + e(ctx['long_rule'])) if ctx.get('long_rule') else ""}</p>
 {flash(ctx)}{plaud_panel(ctx)}<div class="two"><section class="panel"><h2 style="font-size:15px;margin-top:0">Recordings</h2>{recordings_table(ctx)}</section>{activity(ctx, "Recent runs")}</div>
 <div style="margin-top:16px">{notes_panel(ctx)}</div><div class="panel" style="margin-top:16px">{account_bits(ctx)}
@@ -856,7 +856,7 @@ def claude_page(ctx: dict) -> str:
     failures = "".join(f'<li><strong>{e(f.get("name") or rid)}</strong>: {e(f["error"])}</li>' for rid, f in ctx["failed"].items())
     body = f"""<div style="max-width:820px;margin:0 auto;padding:24px 20px 48px"><div class="spread"><a href="/">← OpenPlaud</a>{switcher(ctx)}</div>
 <h1>Send to Claude</h1>{flash(ctx)}{status}
-{f'<div class="panel"><strong>Not sent</strong><ul>{failures}</ul><p class="muted" style="font-size:13px;margin-bottom:0">Rate limits and overloads are retried on the next sync. Other errors wait for you: fix the setting, then use Send to Claude on the recording.</p></div>' if failures else ''}
+{f'<div class="panel"><strong>Not sent</strong><ul>{failures}</ul><p class="muted" style="font-size:13px;margin-bottom:0">Rate limits are retried on the next check. Other errors wait for you: fix the setting, then use Send to Claude on the recording.</p></div>' if failures else ''}
 <h2>How it works</h2><p>Each new recording's notes and transcript start a session in a Claude <em>scheduled task</em> on your Claude account. The session appears with your other sessions at claude.ai/code and in the Claude app's Code tab, where you can read it and keep chatting. It uses your Claude subscription, not an API key.</p>
 <h2>Set it up once</h2><ol class="stack" style="padding-left:20px">
 <li>Open <a href="https://claude.ai/code/routines" target="_blank" rel="noopener noreferrer">claude.ai/code/routines</a> and create a new scheduled task (Claude calls these Routines). Paste the prompt below. Under Connectors, keep only what it needs (Plaud, if you added it).</li>
