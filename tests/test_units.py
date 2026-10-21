@@ -426,3 +426,13 @@ class SweepFive(unittest.TestCase):
                                                     "r2": {"error": "429", "retryable": True}}}})
         self.assertTrue(c["failed"]["r1"]["unknown"])
         self.assertFalse(c["failed"]["r2"]["unknown"])
+
+
+class SweepSeven(unittest.TestCase):
+    def test_a_moved_note_is_only_found_for_its_own_recording(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "A").mkdir()
+        (root / "A" / "n.md").write_text("# T\n\n- Plaud file ID: `rec_b`\n")
+        entry = {"file": str(root / "n.md")}
+        self.assertIsNone(nt.note_for(root, entry, "rec_a"))
+        self.assertEqual(nt.note_for(root, entry, "rec_b"), root / "A" / "n.md")

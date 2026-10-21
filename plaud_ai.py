@@ -286,8 +286,11 @@ class Plaud:
         return [npx, "-y", "@plaud-ai/mcp@latest"]
 
     def _send(self, msg: dict) -> None:
-        self.proc.stdin.write(json.dumps(msg) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            raise PlaudError("Plaud MCP server exited unexpectedly.") from None
 
     def _rpc(self, method: str, params: dict) -> dict:
         self._id += 1
@@ -300,10 +303,14 @@ class Plaud:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if msg.get("id") == self._id:
-                if "error" in msg:
-                    raise PlaudError(msg["error"].get("message", str(msg["error"])))
-                return msg["result"]
+            if not isinstance(msg, dict) or msg.get("id") != self._id:
+                continue
+            if "error" in msg:
+                err = msg["error"]
+                raise PlaudError(str(err.get("message") or err) if isinstance(err, dict) else str(err))
+            if not isinstance(msg.get("result"), dict):
+                raise PlaudError("Plaud MCP server sent a reply OpenPlaud doesn't understand.")
+            return msg["result"]
 
     def call(self, tool: str, **args) -> str:
         result = self._rpc("tools/call", {"name": tool, "arguments": args})
@@ -663,6 +670,8 @@ class ClaudeBackend:
         self.usage.add(used_in, used_out, model_cost(self.cfg["model"], used_in, used_out))
         if msg.stop_reason == "refusal":
             raise RuntimeError("Claude declined to process this recording.")
+        if msg.stop_reason == "max_tokens":
+            raise RuntimeError("Claude's notes were cut off at the length limit; not saved. Try again or pick another model.")
         return "".join(b.text for b in msg.content if b.type == "text").strip()
 
     def check(self) -> str:
@@ -713,6 +722,8 @@ class ChatGPTBackend:
                        model_cost(self.cfg["model"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)))
         if choice.get("finish_reason") == "content_filter":
             raise RuntimeError("OpenAI declined to process this recording.")
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError("ChatGPT's notes were cut off at the length limit; not saved. Try again or pick another model.")
         return (choice["message"].get("content") or "").strip()
 
     def check(self) -> str:
@@ -869,6 +880,8 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
         body = run_task(backend, transcript, instructions, title, log)
     finally:
         record_usage(backend)
+    if not body.strip():
+        raise RuntimeError(f"{backend.name} returned empty notes; nothing was saved. It is tried again next time.")
     out_dir.mkdir(parents=True, exist_ok=True)
     path = write_new(out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md",
         f"# {title}\n\n- Date: {recording_date(rec)}\n- Duration: {duration(rec)}\n- Plaud file ID: `{fid}`\n"

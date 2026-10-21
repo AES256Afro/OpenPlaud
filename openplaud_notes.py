@@ -93,14 +93,21 @@ def all_notes(root: Path) -> list[Path]:
     return [p for _, p in sorted(found, key=lambda pair: pair[0], reverse=True)]
 
 
-def note_for(root: Path, entry: dict | None) -> Path | None:
-    """Where a processed recording's note is now, following it if it was moved."""
+def note_for(root: Path, entry: dict | None, rid: str | None = None) -> Path | None:
+    """Where a processed recording's note is now, following it if it was moved outside the app. A note found by
+    its file name only counts if it names the same recording (`rid`), so two same-named notes never get mixed up."""
     if not entry or not entry.get("file"):
         return None
     path = Path(entry["file"]).resolve()
     if path.exists() and root in path.parents:
         return path
-    return next(iter(sorted(root.rglob(path.name))), None)
+    for candidate in sorted(root.rglob(path.name)):
+        try:
+            if rid is None or plaud_id(candidate.read_text()) == rid:
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 MOVES_LOG = "moves.log"

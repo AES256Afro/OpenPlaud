@@ -243,7 +243,7 @@ class Jobs:
                     self.say(f"– {file_id} is already in Claude; not sent again")
                     return
                 rec = pa.unwrap_file(p.call_json("get_file", file_id=file_id))
-                note = nt.note_for(out_dir, state["processed"].get(file_id))
+                note = nt.note_for(out_dir, state["processed"].get(file_id), file_id)
                 if note:
                     send_to_claude(rec, note, pa.fetch_transcript(p, file_id), self.say, manual=True)
                 else:
@@ -258,7 +258,7 @@ class Jobs:
         for rid, failure in list(claude_state(state)["failed"].items()):
             if not failure.get("retryable"):
                 continue
-            note = nt.note_for(out_dir, state["processed"].get(rid))
+            note = nt.note_for(out_dir, state["processed"].get(rid), rid)
             if not note:
                 continue
             try:
@@ -416,7 +416,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
             for r in raw:
                 rid = pa.rec_id(r)
                 when = pa.recorded_at(r)
-                path = nt.note_for(root, state["processed"].get(rid))
+                path = nt.note_for(root, state["processed"].get(rid), rid)
                 note = by_path.get(path.resolve()) if path else None
                 if rid == jobs.active_id:
                     status = "writing"
@@ -473,7 +473,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         search = nt.search(root, query["q"], titles)
         for hit in search:
             if hit["kind"] == "transcript":
-                path = nt.note_for(root, state["processed"].get(hit["id"]))
+                path = nt.note_for(root, state["processed"].get(hit["id"]), hit["id"])
                 hit["url"] = nt.note_url(root, path) if path else None
 
     selected = None

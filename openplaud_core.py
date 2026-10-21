@@ -56,8 +56,10 @@ class PlaudSession:
         try:
             info = json.loads(self.get().call("get_current_user"))
             who = info.get("email") or info.get("nickname") or "your Plaud account"
-        except pa.PlaudError:
+        except pa.NotSignedIn:
             who = None
+        except (pa.PlaudError, ValueError, AttributeError):
+            return who  # a passing error: keep what we knew rather than showing "signed out" for 5 minutes
         finally:
             self.lock.release()
         self._user = (time.time(), who)
@@ -105,6 +107,10 @@ class PlaudSignIn:
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
+            return
+        if self.plaud.lock.locked():
+            self.state = {"status": "failed", "url": None,
+                          "message": "Plaud is busy with a check right now. Try signing in again when it finishes."}
             return
         self.url_file.unlink(missing_ok=True)
         self.state = {"status": "starting", "url": None, "message": None}
