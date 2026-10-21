@@ -123,7 +123,14 @@ ul.plain{list-style:none;margin:0;padding:0}
 .chips{gap:6px} .chip{font-size:13px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);text-decoration:none;color:var(--ink);white-space:nowrap}
 .chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 .searchwrap{max-width:1200px;margin:0 auto;padding:0 20px}
-@media (max-width:700px){ .hide-sm{display:none} .topbar{padding:10px 14px} }
+@media (max-width:700px){ .hide-sm{display:none} .topbar{padding:10px 14px}
+  select{max-width:100%}
+  /* On a phone each recording is a small card instead of a wide table row. */
+  table.recs,table.recs tbody{display:block} table.recs tr.head{display:none}
+  table.recs tr{display:grid;grid-template-columns:28px 1fr auto;gap:4px 8px;padding:10px 0;border-top:1px solid var(--line)}
+  table.recs td{border:0;padding:0} table.recs td.when{grid-column:2;font-size:12px;color:var(--muted)}
+  table.recs td.name{grid-column:2 / 4;font-weight:600} table.recs td.status{grid-column:3;grid-row:1}
+  table.recs td.acts{grid-column:1 / 4} }
 """
 
 
@@ -321,13 +328,13 @@ def recordings_table(ctx: dict, compact: bool = False) -> str:
         return f'<p class="muted">No recordings in the last {ctx["list_days"]} days.</p>'
     rows = "".join(
         f'<tr><td style="width:28px"><input type="checkbox" form="bulkrun" name="ids" value="{e(r["id"])}" aria-label="Select {e(r["name"])}"></td>'
-        f'<td class="mono" style="white-space:nowrap">{e(r["when_s"])}</td><td class="hide-sm">{e(r["duration"])}</td>'
-        f'<td>{open_link(ctx, r)}</td><td>{badge(r)}</td><td><div class="row">{run_form(ctx, r, compact=True)}{claude_bits(ctx, r)}</div></td></tr>' for r in recs)
+        f'<td class="mono when" style="white-space:nowrap">{e(r["when_s"])}</td><td class="hide-sm">{e(r["duration"])}</td>'
+        f'<td class="name">{open_link(ctx, r)}</td><td class="status">{badge(r)}</td><td class="acts"><div class="row">{run_form(ctx, r, compact=True)}{claude_bits(ctx, r)}</div></td></tr>' for r in recs)
     bulk = (f'<form id="bulkrun" class="row" method="post" action="/process-many" style="margin:0 0 8px">'
             f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><span class="muted" style="font-size:13px">Selected recordings:</span>'
             f'<select name="task" aria-label="What to write for the selected recordings">{task_options(ctx)}</select>'
             f'{model_select(ctx, "Model for the selected recordings")}<button class="btn small">Run selected</button></form>')
-    return (f'{bulk}<div class="scroll"><table><tr><th><span class="sr-only">Select</span></th><th>Recorded</th><th class="hide-sm">Length</th>'
+    return (f'{bulk}<div class="scroll"><table class="recs"><tr class="head"><th><span class="sr-only">Select</span></th><th>Recorded</th><th class="hide-sm">Length</th>'
             f'<th>Name</th><th>Status</th><th></th></tr>{rows}</table></div>')
 
 
@@ -511,7 +518,9 @@ def look_inbox(ctx):
 .inbox nav{flex:1 1 200px;max-width:250px;padding:16px 12px;border-right:1px solid var(--line);background:var(--panel)}
 .inbox .list{flex:1 1 320px;max-width:420px;border-right:1px solid var(--line);background:var(--panel2)}
 .inbox .list article{padding:14px 16px;border-bottom:1px solid var(--line)}
-.inbox main{flex:999 1 460px;min-width:0;padding:24px 32px;background:var(--panel)}"""
+.inbox main{flex:999 1 460px;min-width:0;padding:24px 32px;background:var(--panel)}
+@media (max-width:700px){.inbox nav{max-width:none;flex-basis:100%;order:3;border-right:0;border-top:1px solid var(--line)}
+ .inbox .list{max-width:none;border-right:0} .inbox main{order:2;padding:18px 16px}}"""
     cards = []
     for r in ctx["recordings"] or []:
         sel = r.get("note_rel") and r["note_rel"] == (ctx["note"] or {}).get("rel")
