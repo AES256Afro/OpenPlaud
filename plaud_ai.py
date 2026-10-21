@@ -499,6 +499,28 @@ CLAUDE_PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.00, 1
 CLAUDE_LONG_PROMPT = {"claude-haiku-5-5": (100_000, (0.50, 2.50))}
 
 
+def extra_prices() -> dict[str, tuple[float, float]]:
+    """Prices the owner sets for other models: OPENPLAUD_PRICES="gpt-5=1.25/10,gpt-5-mini=0.25/2" (dollars per
+    million input/output tokens). Malformed entries are ignored."""
+    prices = {}
+    for item in os.environ.get("OPENPLAUD_PRICES", "").split(","):
+        name, _, rates = item.strip().partition("=")
+        rate_in, _, rate_out = rates.partition("/")
+        try:
+            prices[name.strip()] = (float(rate_in), float(rate_out))
+        except ValueError:
+            continue
+    return prices
+
+
+def model_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    """What a run cost in dollars, or None when the model has no known price."""
+    if model in CLAUDE_PRICES:
+        return claude_cost(model, input_tokens, output_tokens)
+    rates = extra_prices().get(model)
+    return (input_tokens * rates[0] + output_tokens * rates[1]) / 1_000_000 if rates else None
+
+
 def claude_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
     if model not in CLAUDE_PRICES:
         return None
@@ -684,7 +706,8 @@ class ChatGPTBackend:
         })
         choice = data["choices"][0]
         u = data.get("usage") or {}
-        self.usage.add(u.get("prompt_tokens", 0), u.get("completion_tokens", 0), None)
+        self.usage.add(u.get("prompt_tokens", 0), u.get("completion_tokens", 0),
+                       model_cost(self.cfg["model"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)))
         if choice.get("finish_reason") == "content_filter":
             raise RuntimeError("OpenAI declined to process this recording.")
         return (choice["message"].get("content") or "").strip()
@@ -750,7 +773,10 @@ def _add_usage(state: dict, backend, u) -> None:
 
 def priced(backend) -> bool:
     """Whether a run on this backend can be costed (and so kept under the monthly cap)."""
-    return not getattr(backend, "paid", False) or (isinstance(backend, ClaudeBackend) and backend.cfg["model"] in CLAUDE_PRICES)
+    if not getattr(backend, "paid", False):
+        return True
+    model = backend.cfg["model"]
+    return model in extra_prices() or (isinstance(backend, ClaudeBackend) and model in CLAUDE_PRICES)
 
 
 def record_failure(file_id: str, err: Exception) -> int:
@@ -832,7 +858,7 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     cap = float(os.environ.get("OPENPLAUD_MONTHLY_CAP", "0") or 0)
     if cap and getattr(backend, "paid", False) and not priced(backend):
         raise Unpriced(f"A monthly cap is set, but OpenPlaud has no price for {backend.name}, so it can't keep that model "
-                         "under the cap. Pick a Claude model or the local model, or remove the cap.")
+                         "under the cap. Add its price to OPENPLAUD_PRICES, pick another model, or remove the cap.")
     if cap and getattr(backend, "paid", False) and month_spend() >= cap:
         raise CapReached(f"This month's spending cap (${cap:.2f}) is reached; paid runs wait for next month or a higher cap.")
     log(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}")
