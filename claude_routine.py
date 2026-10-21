@@ -11,6 +11,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -83,7 +84,13 @@ def fire(url: str, token: str, text: str, timeout: float = 30) -> dict:
                            int(retry_after) if retry_after and retry_after.isdigit() else None,
                            # Only a rate limit says for certain that no session was started; a 5xx may come after one was.
                            retryable=e.code == 429) from None
-    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as e:
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+            # Refused or no address: the request never reached Claude, so trying again later is safe.
+            raise RoutineError(f"Couldn't reach Claude ({e.reason}). Tried again on the next check.", retryable=True) from None
+        raise RoutineError(f"Couldn't read Claude's answer ({type(e).__name__}). Not retried automatically, to avoid a duplicate "
+                           "session; check claude.ai/code before sending it again.") from None
+    except (TimeoutError, OSError, http.client.HTTPException, ValueError) as e:
         # The session may or may not have been created: never repeat automatically.
         raise RoutineError(f"Couldn't read Claude's answer ({type(e).__name__}). Not retried automatically, to avoid a duplicate "
                            "session; check claude.ai/code before sending it again.") from None

@@ -38,6 +38,7 @@ After that, recordings sync on a schedule, and each one can also be run by hand.
 | `OPENPLAUD_SYNC_EVERY` | Minutes between automatic syncs; `0` turns it off | `60` |
 | `OPENPLAUD_SYNC_DAYS` | How far back each sync looks, in days | `7` |
 | `OPENPLAUD_PASSWORD` | Password for the web page; empty means no password | |
+| `OPENPLAUD_ALLOWED_HOSTS` | Extra host names the page answers to, comma-separated (e.g. `notes.example.org`). IP addresses, `localhost`, `*.local`, single-label names and `*.ts.net` always work; any other name gets *421 Unknown host name*, which blocks DNS-rebinding pages. | |
 | `OPENPLAUD_LOOK` | Default look: `inbox`, `timeline`, `actions`, `command`, `board`, `reader`, `library`, `calendar`, `phone` or `console`. Each browser can pick its own from the page. | `inbox` |
 
 | `CLAUDE_ROUTINE_URL` | Fire URL of a Claude scheduled task's API trigger (Send to Claude) | |
