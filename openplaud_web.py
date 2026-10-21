@@ -279,6 +279,20 @@ def transcript_for(file_id: str | None, may_ask_plaud: bool) -> list[str] | None
     return pa.apply_speakers(text, pa.load_state().get("speakers", {}).get(file_id)).splitlines()
 
 
+def speakers_for(file_id: str | None) -> dict | None:
+    """Plaud's speaker labels in a recording, each with the name the owner gave it (if any)."""
+    raw = pa.load_transcript(file_id) if file_id else None
+    if not raw:
+        return None
+    labels = []
+    for line in raw.splitlines():
+        m = re.match(r"^\[[^\]]*\] ([^:]+): ", line)
+        if m and m.group(1) not in labels:
+            labels.append(m.group(1))
+    names = pa.load_state().get("speakers", {}).get(file_id, {})
+    return {"id": file_id, "labels": [(label, names.get(label, "")) for label in labels[:20]]}
+
+
 def model_label(cfg: dict) -> str:
     provider = cfg["backend"]
     model = {"claude": cfg["claude"]["model"], "chatgpt": cfg["chatgpt"]["model"], "local": cfg["local"]["model"]}.get(provider, "?")
@@ -429,6 +443,8 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         "show": show if show in FILTERS else "", "q": query.get("q", ""), "search": search, "undo": query.get("undo", ""),
         "all_recordings": all_recordings, "moves": nt.move_history(root, 10),
         "models": model_choices(cfg), "prompts": sorted(saved_prompts()), "spend": pa.month_spend(state), "cap": MONTHLY_CAP,
+        "health": core.plaud_health() if plaud_state["state"] == "signed_in" else None,
+        "speakers": speakers_for(nt.plaud_id(selected["text"])) if selected and look == "reader" else None,
         "long_rule": f"Longer than {LONG_MINUTES} min → {LONG_MODEL}" if LONG_MINUTES and LONG_MODEL else "",
     }
 
@@ -538,7 +554,7 @@ class Handler(BaseHTTPRequestHandler):
         mark_read(note["text"])
         cfg = pa.load_config()
         ctx = {"look": look, "flash": flash, "here": here, "folder": note["folder"], "folders": nt.all_folders(root),
-               "models": model_choices(cfg)}
+               "models": model_choices(cfg), "speakers": speakers_for(note["plaud_id"]) if look == "reader" else None}
         with_transcript = look == "reader"
         transcript = transcript_for(nt.plaud_id(note["text"]), True) if with_transcript else None
         self._send(200, ui.note_page(ctx, note, transcript, with_transcript))
@@ -658,6 +674,21 @@ class Handler(BaseHTTPRequestHandler):
             for file_id in ids:
                 jobs.add(("process", file_id, task, spec, custom if task == "custom" else ""))
             return self._redirect(back, "Queued." if len(ids) == 1 else f"Queued {len(ids)} recordings.")
+        if path == "/speakers":
+            file_id = form.get("id", "")
+            labels, names = form.get("label[]", [])[:20], form.get("name[]", [])[:20]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", file_id) or len(labels) != len(names):
+                return self._redirect(back, "Couldn't save those names.")
+            state = pa.load_state()
+            mapping = state.setdefault("speakers", {}).setdefault(file_id, {})
+            for label, name in zip(labels, names):
+                name = re.sub(r"[\x00-\x1f:\[\]]", "", name).strip()[:40]
+                if name:
+                    mapping[label[:40]] = name
+                else:
+                    mapping.pop(label[:40], None)
+            pa.save_state(state)
+            return self._redirect(back, "Speaker names saved. They show in the transcript and in future runs.")
         if path == "/prompts/save":
             name, text = form.get("name", "").strip()[:40], form.get("prompt", "").strip()[:8000]
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", name) or not text:

@@ -189,3 +189,21 @@ class Engine(unittest.TestCase):
         pa.STATE_PATH.write_text("{not json")
         self.assertEqual(pa.load_state(), {"processed": {}})
         self.assertTrue(any(p.name.startswith(pa.STATE_PATH.name + ".damaged-") for p in pa.STATE_PATH.parent.iterdir()))
+
+
+class Health(unittest.TestCase):
+    def _token(self, payload):
+        import base64
+        import json as _json
+        part = base64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=")
+        path = Path(tempfile.mkdtemp()) / "tokens.json"
+        path.write_text(_json.dumps({"refresh_token": f"h.{part}.s"}))
+        return path
+
+    def test_reads_only_the_end_date(self):
+        ok = core.plaud_health(self._token({"exp": int(time.time()) + 20 * 86400}))
+        self.assertFalse(ok["warn"])
+        self.assertGreater(ok["days"], 19)
+        self.assertTrue(core.plaud_health(self._token({"exp": int(time.time()) + 3600}))["warn"])
+        self.assertEqual(core.plaud_health(self._token({}))["until"], None)
+        self.assertIsNone(core.plaud_health(Path(tempfile.mkdtemp()) / "missing.json"))

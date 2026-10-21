@@ -68,6 +68,10 @@ class EndToEnd(unittest.TestCase):
                    PLAUD_AI_CONFIG=str(cls.data / "none.toml"), HOME=str(cls.data))
         env.pop("CLAUDE_ROUTINE_URL", None)
         env.pop("CLAUDE_ROUTINE_TOKEN", None)
+        import base64
+        (cls.data / ".plaud").mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 10 * 86400}).encode()).decode().rstrip("=")
+        (cls.data / ".plaud" / "tokens-mcp.json").write_text(json.dumps({"access_token": "a", "refresh_token": f"h.{claims}.s"}))
         cls.proc = subprocess.Popen([sys.executable, str(ROOT / "openplaud_web.py")], env=env, stdout=cls.log, stderr=subprocess.STDOUT)
         cls.base = f"http://127.0.0.1:{cls.port}"
         for _ in range(100):
@@ -149,7 +153,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("results for", html)
         self.assertIn("transcript at", html)
         self.assertIn("Notes for Weekly security sync.", self.get("/?q=weekly").read().decode())
-        waiting = self.get("/?show=waiting", look="console").read().decode()
+        waiting = self.get("/?show=waiting", look="console").read().decode().split('<dialog id="palette"')[0]
         self.assertIn("Voice memo", waiting)
         self.assertNotIn('value="rec_long"', waiting)
         self.assertIn("Unread", self.get("/", look="console").read().decode())
@@ -203,6 +207,16 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(len(names), 8)
         bad = self.post("/process", id="rec_sam", task="custom", prompt="   ", model="", back="/")
         self.assertIn("custom prompt is empty", urllib.parse.unquote_plus(bad.geturl()))
+
+        # The palette is in every look; the sign-in's end date shows; speaker names apply to the transcript.
+        for look in LOOKS:
+            self.assertIn('id="palette"', self.get("/", look=look).read().decode(), look)
+        self.assertIn("sign-in good until", self.get("/", look="console").read().decode())
+        self.post("/speakers", id="rec_sync", label="Priya", name="Priya Patel", back="/")
+        moved = "Work/" + sync_note.name
+        page = self.get("/notes/" + urllib.parse.quote(moved), look="reader").read().decode()
+        self.assertIn("Priya Patel", page)
+        self.assertIn('value="Priya Patel"', page)
 
         # The activity log is kept on disk.
         self.assertIn("Sync finished", (self.data / "activity.log").read_text())

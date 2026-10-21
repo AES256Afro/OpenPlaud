@@ -285,6 +285,10 @@ def plaud_panel(ctx: dict) -> str:
 def account_bits(ctx: dict) -> str:
     p = ctx["plaud"]
     who = f'<span class="muted">Plaud: {e(p["who"])}</span>' if p["state"] == "signed_in" else ""
+    h = ctx.get("health")
+    if h and h.get("until"):
+        who += (f' <span class="badge warn">Plaud sign-in ends {e(h["until"])}: sign out and in again soon</span>' if h["warn"]
+                else f' <span class="muted">· sign-in good until {e(h["until"])} (renews itself)</span>')
     signout = '<form class="inline" method="post" action="/plaud/signout"><button class="btn small">Sign out of Plaud</button></form>' if p["state"] == "signed_in" else ""
     test = f'<form class="inline" method="post" action="/test"><button class="btn small">Test {e(ctx["provider"])}</button></form>'
     logout = '<form class="inline" method="post" action="/logout"><button class="btn small">Lock</button></form>' if ctx["password"] else ""
@@ -458,6 +462,18 @@ def render_markdown(md: str) -> str:
     return "\n".join(out)
 
 
+def speakers_form(ctx: dict) -> str:
+    sp = ctx.get("speakers")
+    if not sp or not sp["labels"]:
+        return ""
+    rows = "".join(f'<label class="row" style="font-size:13px"><span style="min-width:90px">{e(label)}</span>'
+                   f'<input type="hidden" name="label" value="{e(label)}"><input type="text" name="name" value="{e(name)}" maxlength="40" placeholder="Name" style="width:150px"></label>'
+                   for label, name in sp["labels"])
+    return (f'<details style="margin:0 0 12px"><summary>Speaker names</summary><form method="post" action="/speakers" class="stack" style="margin-top:8px;gap:6px">'
+            f'<input type="hidden" name="id" value="{e(sp["id"])}"><input type="hidden" name="back" value="{e(ctx.get("here", "/"))}">{rows}'
+            f'<div><button class="btn small">Save names</button></div></form></details>')
+
+
 def transcript_html(lines: list[str] | None) -> str:
     if lines is None:
         return '<p class="muted">The transcript appears here when Plaud can be reached.</p>'
@@ -568,44 +584,68 @@ def look_actions(ctx):
     return body, css
 
 
-def look_command(ctx):
-    css = """.cmd{max-width:1100px;margin:0 auto;padding:26px 20px 40px;font-family:var(--mono)}
-.cmd .line{display:flex;gap:20px;padding:10px 12px;border-radius:8px;flex-wrap:wrap} .cmd .line:nth-child(odd){background:var(--panel)}
-dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:16px;padding:0;width:min(680px,calc(100% - 32px));box-shadow:0 30px 80px rgba(0,0,0,.6)}
-dialog::backdrop{background:rgba(0,0,0,.55)} dialog input{width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;font:500 17px var(--mono);padding:16px 18px;min-height:56px}
-dialog ul{list-style:none;margin:0;padding:8px;max-height:52vh;overflow:auto} dialog li a,dialog li button{display:block;width:100%;text-align:left;font:inherit;color:var(--ink);background:transparent;border:0;padding:10px 12px;border-radius:8px;text-decoration:none;cursor:pointer}
-dialog li.hit a,dialog li.hit button{background:var(--panel2);box-shadow:inset 2px 0 0 var(--accent)} kbd{font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:var(--muted)}"""
-    cmds = ['<li data-k="sync now refresh"><form method="post" action="/sync"><button>Sync now</button></form></li>']
-    for r in ctx["recordings"] or []:
-        if r["note_url"]:
-            cmds.append(f'<li data-k="open {e(r["name"].lower())}"><a href="{e(r["note_url"])}">Open notes: {e(r["name"])}</a></li>')
-        cmds.append(f'<li data-k="run {e(r["name"].lower())}"><form method="post" action="/process"><input type="hidden" name="id" value="{e(r["id"])}">'
-                    f'<input type="hidden" name="task" value="{e(ctx["default_task"])}"><button>Run: {e(r["name"])}</button></form></li>')
-        if r.get("claude_url"):
-            cmds.append(f'<li data-k="claude open {e(r["name"].lower())}"><a href="{e(r["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude: {e(r["name"])}</a></li>')
-        elif ctx.get("claude_on"):
-            cmds.append(f'<li data-k="claude send {e(r["name"].lower())}"><form method="post" action="/claude/send"><input type="hidden" name="id" value="{e(r["id"])}">'
-                        f'<button>Send to Claude: {e(r["name"])}</button></form></li>')
-    for f in ctx["folders"]:
-        cmds.append(f'<li data-k="go folder {e(f.lower())}"><a href="{e("/?" + urllib.parse.urlencode({"folder": f}) + "#notes")}">Go to folder: {e(f)}</a></li>')
-    for k, v in LOOKS.items():
-        cmds.append(f'<li data-k="look theme {e(v.lower())}"><form method="post" action="/look"><input type="hidden" name="look" value="{k}"><button>Look: {e(v)}</button></form></li>')
-    lines = "".join(f'<div class="line"><span class="muted">{e(r["when_s"])}</span><span style="flex:1">{open_link(ctx, r)}</span>{badge(r)}</div>'
-                    for r in ctx["recordings"] or []) or recordings_table(ctx)
-    js = """<script>
-const d=document.getElementById('palette'),q=document.getElementById('q'),items=[...d.querySelectorAll('li')];
+PALETTE_CSS = """dialog.pal{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:16px;padding:0;width:min(680px,calc(100% - 32px));box-shadow:0 30px 80px rgba(0,0,0,.45)}
+dialog.pal::backdrop{background:rgba(0,0,0,.5)} dialog.pal input{width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;background:transparent;font:500 17px var(--mono);padding:16px 18px;min-height:56px}
+dialog.pal ul{list-style:none;margin:0;padding:8px;max-height:52vh;overflow:auto} dialog.pal li a,dialog.pal li button{display:block;width:100%;text-align:left;font:inherit;color:var(--ink);background:transparent;border:0;padding:10px 12px;border-radius:8px;text-decoration:none;cursor:pointer}
+dialog.pal li.hit a,dialog.pal li.hit button{background:var(--panel2);box-shadow:inset 2px 0 0 var(--accent)} kbd{font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:var(--muted)}
+dialog.pal dl{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;padding:18px 22px;margin:0}"""
+
+PALETTE_JS = """<script>
+(function(){const d=document.getElementById('palette'),q=document.getElementById('palq'),help=document.getElementById('palhelp');
+if(!d)return;const items=[...d.querySelectorAll('li')];
 function filt(){const t=q.value.toLowerCase().trim().split(/\\s+/);let first=true;items.forEach(li=>{const ok=t.every(w=>li.dataset.k.includes(w)||li.textContent.toLowerCase().includes(w));li.hidden=!ok;li.classList.toggle('hit',ok&&first);if(ok)first=false;});}
 function open_(){d.showModal();q.value='';filt();q.focus();}
-document.addEventListener('keydown',ev=>{if((ev.metaKey||ev.ctrlKey)&&ev.key.toLowerCase()==='k'){ev.preventDefault();open_();}});
-document.getElementById('openPalette').addEventListener('click',open_);q.addEventListener('input',filt);
-q.addEventListener('keydown',ev=>{if(ev.key==='Enter'){ev.preventDefault();const h=d.querySelector('li.hit a,li.hit button');if(h)h.click();}});
+const typing=el=>el&&(el.isContentEditable||/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+document.addEventListener('keydown',ev=>{
+ if((ev.metaKey||ev.ctrlKey)&&ev.key.toLowerCase()==='k'){ev.preventDefault();open_();return;}
+ if(typing(document.activeElement)||ev.metaKey||ev.ctrlKey||ev.altKey)return;
+ if(ev.key==='/'){const s=document.getElementById('search');if(s){ev.preventDefault();s.focus();}}
+ else if(ev.key==='?'){ev.preventDefault();help.showModal();}});
+document.querySelectorAll('[data-open-palette]').forEach(b=>b.addEventListener('click',open_));
+q.addEventListener('input',filt);
+q.addEventListener('keydown',ev=>{if(ev.key==='Enter'){ev.preventDefault();const h=d.querySelector('li.hit a,li.hit button');if(h)h.click();}});})();
 </script>"""
+
+
+def palette(ctx: dict) -> str:
+    """⌘K / Ctrl-K in every look: sync, open, run, send, go to a folder or filter, switch look."""
+    cmds = ['<li data-k="sync now refresh check"><form method="post" action="/sync"><button>Sync now</button></form></li>']
+    for key, label in FILTER_LABELS:
+        href = "/" if not key else "/?" + urllib.parse.urlencode({"show": key})
+        cmds.append(f'<li data-k="show filter {e(label.lower())}"><a href="{e(href)}">Show: {e(label)}</a></li>')
+    for r in ctx.get("all_recordings") or []:
+        name = e(r["name"].lower())
+        if r["note_url"]:
+            cmds.append(f'<li data-k="open notes {name}"><a href="{e(r["note_url"])}">Open notes: {e(r["name"])}</a></li>')
+        cmds.append(f'<li data-k="run {name}"><form method="post" action="/process"><input type="hidden" name="id" value="{e(r["id"])}">'
+                    f'<input type="hidden" name="task" value="{e(ctx["default_task"])}"><button>Run: {e(r["name"])}</button></form></li>')
+        if r.get("claude_url"):
+            cmds.append(f'<li data-k="claude open {name}"><a href="{e(r["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude: {e(r["name"])}</a></li>')
+        elif ctx.get("claude_on"):
+            cmds.append(f'<li data-k="claude send {name}"><form method="post" action="/claude/send"><input type="hidden" name="id" value="{e(r["id"])}">'
+                        f'<button>Send to Claude: {e(r["name"])}</button></form></li>')
+    for f in ctx.get("folders", []):
+        cmds.append(f'<li data-k="go folder {e(f.lower())}"><a href="{e("/?" + urllib.parse.urlencode({"folder": f}) + "#notes")}">Go to folder: {e(f)}</a></li>')
+    for k, v in LOOKS.items():
+        cmds.append(f'<li data-k="look theme {e(v.lower())}"><form method="post" action="/look"><input type="hidden" name="look" value="{k}">'
+                    f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><button>Look: {e(v)}</button></form></li>')
+    return f"""<dialog id="palette" class="pal" aria-label="Command palette"><label><span class="sr-only">Command</span>
+<input id="palq" type="text" placeholder="Type a command: sync, open…, run…, show…, folder…, look…" autocomplete="off"></label>
+<ul>{''.join(cmds)}</ul><div class="row muted" style="padding:10px 16px;border-top:1px solid var(--line);font-size:12px"><span>↵ run</span><span>esc close</span><span>? all shortcuts</span></div></dialog>
+<dialog id="palhelp" class="pal" aria-label="Keyboard shortcuts"><dl><dt><kbd>⌘K</kbd> / <kbd>Ctrl-K</kbd></dt><dd>Command palette</dd>
+<dt><kbd>/</kbd></dt><dd>Search notes and transcripts</dd><dt><kbd>?</kbd></dt><dd>This list</dd><dt><kbd>Esc</kbd></dt><dd>Close</dd></dl>
+<form method="dialog" style="padding:0 22px 18px"><button class="btn">Close</button></form></dialog>{PALETTE_JS}"""
+
+
+def look_command(ctx):
+    css = """.cmd{max-width:1100px;margin:0 auto;padding:26px 20px 40px;font-family:var(--mono)}
+.cmd .line{display:flex;gap:20px;padding:10px 12px;border-radius:8px;flex-wrap:wrap} .cmd .line:nth-child(odd){background:var(--panel)}"""
+    lines = "".join(f'<div class="line"><span class="muted">{e(r["when_s"])}</span><span style="flex:1">{open_link(ctx, r)}</span>{badge(r)}</div>'
+                    for r in ctx["recordings"] or []) or recordings_table(ctx)
     body = f"""<div class="cmd"><div class="spread"><span class="muted">openplaud ~ {e(ctx['model'])} · {e(sync_text(ctx))}</span>
-<div class="row"><button class="btn" id="openPalette" type="button">Commands <kbd>⌘K</kbd></button>{switcher(ctx)}{sync_button()}</div></div>
+<div class="row"><button class="btn" data-open-palette type="button">Commands <kbd>⌘K</kbd></button>{switcher(ctx)}{sync_button()}</div></div>
 <div style="margin-top:16px">{flash(ctx)}{plaud_panel(ctx)}</div><div style="margin:12px 0 24px">{lines}</div>
-<div style="font-family:var(--font)">{notes_panel(ctx)}<div style="margin-top:16px">{activity(ctx)}</div><div class="panel" style="margin-top:16px">{account_bits(ctx)}</div></div></div>
-<dialog id="palette" aria-label="Command palette"><label><span class="sr-only">Command</span><input id="q" type="text" placeholder="Type a command: sync, open…, run…, folder…, look…" autocomplete="off"></label>
-<ul>{''.join(cmds)}</ul><div class="row muted" style="padding:10px 16px;border-top:1px solid var(--line);font-size:12px"><span>↵ run</span><span>esc close</span><span>⌘K / Ctrl-K anywhere</span></div></dialog>{js}"""
+<div style="font-family:var(--font)">{notes_panel(ctx)}<div style="margin-top:16px">{activity(ctx)}</div><div class="panel" style="margin-top:16px">{account_bits(ctx)}</div></div></div>"""
     return body, css
 
 
@@ -647,7 +687,7 @@ def look_reader(ctx):
     if n:
         main = f"""<div class="spread muted" style="font-size:13px"><span>{e(n['folder'] or 'Top level')}</span><div class="row"><a class="btn small" href="{e(n['url'])}?raw=1">Download .md</a>{move_form(ctx, n['rel'], n['folder'])}</div></div>
 <div class="note">{n['html']}</div>"""
-        side = f'<strong>Transcript</strong><div style="margin-top:12px;font-size:14px">{transcript_html(ctx.get("transcript"))}</div>'
+        side = f'<strong>Transcript</strong><div style="margin-top:12px;font-size:14px">{speakers_form(ctx)}{transcript_html(ctx.get("transcript"))}</div>'
     else:
         main = f'<h1 style="font-size:36px">Pick a note to read</h1><p class="muted">Notes are listed on the left, newest first.</p>{recordings_table(ctx)}'
         side = activity(ctx)
@@ -750,12 +790,12 @@ def dashboard(ctx: dict) -> str:
     bar = topbar(ctx)
     if ctx.get("search") is not None:
         bar = bar.replace('</div><section class="panel"', '</div><div class="searchwrap"><section class="panel"', 1) + "</div>"
-    return page(ctx, "OpenPlaud", bar + body, css, poll=ctx["busy"] or ctx["plaud"]["state"] == "waiting")
+    return page(ctx, "OpenPlaud", bar + body + palette(ctx), css + PALETTE_CSS, poll=ctx["busy"] or ctx["plaud"]["state"] == "waiting")
 
 
 def note_page(ctx: dict, note: dict, transcript: list[str] | None = None, with_transcript: bool = False) -> str:
     side = (f'<aside class="panel" style="flex:1 1 320px;min-width:0;max-height:80vh;overflow:auto"><strong>Transcript</strong>'
-            f'<div style="margin-top:12px;font-size:14px">{transcript_html(transcript)}</div></aside>') if with_transcript else ""
+            f'<div style="margin-top:12px;font-size:14px">{speakers_form(ctx)}{transcript_html(transcript)}</div></aside>') if with_transcript else ""
     custom = ""
     if note.get("plaud_id"):
         custom = f"""<details class="panel" style="margin-top:16px"><summary>Run this recording with your own prompt</summary>

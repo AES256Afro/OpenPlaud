@@ -3,6 +3,7 @@ page passwords and the same-origin check. Importing this module starts nothing."
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -214,3 +215,24 @@ def cookie(headers, name: str) -> str | None:
 
 def safe_back(value: str) -> str:
     return value if value.startswith("/") and not value.startswith("//") else "/"
+
+
+def plaud_health(token_file: Path | None = None) -> dict | None:
+    """How long the saved Plaud sign-in lasts, read from its dates only (never the token itself).
+    The access token renews itself from the refresh token; when the refresh token lapses, sign in again."""
+    path = token_file or Path.home() / ".plaud" / "tokens-mcp.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    refresh = data.get("refresh_token") or ""
+    try:
+        part = refresh.split(".")[1]
+        exp = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("exp")
+    except (IndexError, ValueError, TypeError):
+        exp = None
+    if not exp:
+        return {"until": None, "days": None, "warn": False}
+    until = datetime.fromtimestamp(exp)
+    days = (until - datetime.now()).total_seconds() / 86400
+    return {"until": until.strftime("%-d %b %Y"), "days": round(days, 1), "warn": days < 3}
