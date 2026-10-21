@@ -177,7 +177,7 @@ def save_state(state: dict) -> None:
                 os.fsync(f.fileno())
             if STATE_PATH.exists() and _read_state(STATE_PATH) is not None:
                 bak = STATE_PATH.with_name(STATE_PATH.name + ".bak")
-                shutil.copyfile(STATE_PATH, bak.with_suffix(".bak.tmp"))
+                shutil.copy(STATE_PATH, bak.with_suffix(".bak.tmp"))  # keeps the state file's private mode
                 os.replace(bak.with_suffix(".bak.tmp"), bak)
             os.replace(tmp, STATE_PATH)
         finally:
@@ -861,6 +861,15 @@ def write_new(path: Path, text: str) -> Path:
     raise RuntimeError(f"Couldn't find a free name for {path.name}.")
 
 
+def received_at(rec: dict) -> str:
+    """When Plaud received a recording (its created_at, naive UTC), as local time; now when it isn't given."""
+    try:
+        when = datetime.fromisoformat(rec["created_at"]).replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+        return when.isoformat()
+    except (KeyError, TypeError, ValueError):
+        return datetime.now().isoformat()
+
+
 def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr,
             on_done=None) -> Path:
     fid, title = rec_id(rec), rec.get("name") or rec_id(rec)
@@ -903,8 +912,10 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
     except NoTranscript as e:
         log(f"– skipped {rec.get('name', rec_id(rec))}: {e}")
         with editing_state() as state:
-            # When it was first seen without one (kept, so quick follow-up checks know how recent it is).
-            state.setdefault("no_transcript", {}).setdefault(rec_id(rec), datetime.now().isoformat())
+            # When Plaud received it (else when it was first seen without a transcript), so quick follow-up
+            # checks only chase recordings that are actually recent.
+            entries = state.setdefault("no_transcript", {})
+            entries[rec_id(rec)] = min(entries.get(rec_id(rec), datetime.now().isoformat()), received_at(rec))
         return None
     except (NotSignedIn, CapReached):
         raise
