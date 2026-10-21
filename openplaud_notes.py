@@ -223,10 +223,11 @@ def set_action(path: Path, line_no: int, expected: str, done: bool) -> bool:
         if not m or re.sub(r"\*\*|`", "", m.group(2)).strip() != expected:
             return False
         lines[line_no] = re.sub(r"\[( |x|X)\]", "[x]" if done else "[ ]", lines[line_no], count=1)
+        mode = stat.S_IMODE(path.stat().st_mode)  # keep the note's own permissions
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
         try:
-            os.fchmod(fd, stat.S_IMODE(path.stat().st_mode))  # keep the note's own permissions
             with os.fdopen(fd, "w", newline="") as f:
+                os.fchmod(f.fileno(), mode)
                 f.write("\n".join(lines))
             os.replace(tmp, path)
         finally:
