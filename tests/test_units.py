@@ -436,3 +436,21 @@ class SweepSeven(unittest.TestCase):
         entry = {"file": str(root / "n.md")}
         self.assertIsNone(nt.note_for(root, entry, "rec_a"))
         self.assertEqual(nt.note_for(root, entry, "rec_b"), root / "A" / "n.md")
+
+
+class CheckClockTests(unittest.TestCase):
+    def test_schedule_and_quick_follow_ups(self):
+        clock = core.CheckClock(30, first_delay=0)
+        self.assertTrue(clock.take_due())
+        self.assertFalse(clock.take_due())  # once, until the check finishes
+        clock.checked([])
+        self.assertAlmostEqual(clock.next - time.time(), 30 * 60, delta=2)
+        clock.checked([time.time() - 120])  # something recent still waits on Plaud
+        self.assertTrue(clock.quick_mode)
+        self.assertAlmostEqual(clock.next - time.time(), 3 * 60, delta=2)
+        clock.checked([time.time() - 3 * 3600])  # waiting for hours: back to the normal schedule
+        self.assertFalse(clock.quick_mode)
+        off = core.CheckClock(0)
+        off.checked([time.time()])
+        self.assertIsNone(off.next)
+        self.assertFalse(off.stale(5))

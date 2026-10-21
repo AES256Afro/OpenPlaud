@@ -330,3 +330,46 @@ def plaud_health(token_file: Path | None = None) -> dict | None:
     until = datetime.fromtimestamp(exp)
     days = (until - datetime.now()).total_seconds() / 86400
     return {"until": until.strftime("%-d %b %Y"), "days": round(days, 1), "warn": days < 3}
+
+
+class CheckClock:
+    """When the next automatic check for new recordings is due: on the regular schedule, and every few minutes
+    while a recent recording is still waiting on Plaud (no transcript or summary yet), so it shows up soon after
+    Plaud finishes instead of at the next scheduled check. With the schedule off (every=0) nothing is automatic."""
+
+    def __init__(self, every_min: int, quick_min: int = 3, window_min: int = 60, first_delay: float = 30):
+        self.every, self.quick, self.window = every_min * 60, quick_min * 60, window_min * 60
+        self.next: float | None = time.time() + first_delay if every_min > 0 else None
+        self.last: float | None = None
+        self.quick_mode = False
+
+    def checked(self, waiting_since: list[float] = ()) -> None:
+        """Record a finished check. `waiting_since` holds when each recording still waiting on Plaud was first seen."""
+        now = time.time()
+        self.last = now
+        if not self.every:
+            self.next, self.quick_mode = None, False
+            return
+        self.quick_mode = any(now - t < self.window for t in waiting_since)
+        self.next = now + (min(self.quick, self.every) if self.quick_mode else self.every)
+
+    def take_due(self) -> bool:
+        """True once when a check is due (the caller queues it); the next time is set when that check finishes."""
+        if self.next is not None and time.time() >= self.next:
+            self.next = None
+            return True
+        return False
+
+    def stale(self, minutes: float) -> bool:
+        return self.last is None or time.time() - self.last > minutes * 60
+
+    def next_text(self) -> datetime | None:
+        return datetime.fromtimestamp(self.next) if self.next else None
+
+
+def trigger_allowed(headers, token: str) -> bool:
+    """A request carrying `Authorization: Bearer <token>` for the check trigger (a token of 16+ characters only)."""
+    given = headers.get("Authorization", "")
+    if len(token) < 16 or not given.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(given[7:].strip().encode(), token.encode())

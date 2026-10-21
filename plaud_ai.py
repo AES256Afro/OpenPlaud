@@ -903,7 +903,8 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
     except NoTranscript as e:
         log(f"– skipped {rec.get('name', rec_id(rec))}: {e}")
         with editing_state() as state:
-            state.setdefault("no_transcript", {})[rec_id(rec)] = datetime.now().isoformat()
+            # When it was first seen without one (kept, so quick follow-up checks know how recent it is).
+            state.setdefault("no_transcript", {}).setdefault(rec_id(rec), datetime.now().isoformat())
         return None
     except (NotSignedIn, CapReached):
         raise
