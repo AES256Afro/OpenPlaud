@@ -689,7 +689,8 @@ def look_command(ctx):
 def look_board(ctx):
     css = """.bd{padding:22px} .cols{display:grid;grid-template-columns:repeat(6,minmax(220px,1fr));gap:14px;overflow-x:auto}
 .col{background:var(--panel2);border-radius:var(--radius);padding:12px;min-height:200px} .col h2{font-size:14px;margin:2px 4px 12px;display:flex;justify-content:space-between}
-.col .card{margin-bottom:10px;padding:12px}"""
+.col .card{margin-bottom:10px;padding:12px}
+@media (max-width:700px){.bd{padding:16px} .cols{grid-template-columns:1fr;overflow:visible} .col{min-height:0}}"""
     columns = [("Failed", ["failed", "stuck"]), ("New", ["new"]), ("Waiting on Plaud", ["no_transcript"]), ("Writing", ["writing", "queued"]), ("Ready to file", ["ready"]), ("Filed", ["filed"])]
     cols = []
     for title, kinds in columns:
@@ -754,6 +755,7 @@ def look_library(ctx):
 def look_calendar(ctx):
     css = """.cal{padding:22px 24px} .week{display:grid;grid-template-columns:repeat(7,minmax(120px,1fr));gap:8px;min-width:900px}
 .day{background:var(--panel);border-radius:var(--radius);padding:8px;min-height:420px;display:flex;flex-direction:column;gap:8px}
+@media (max-width:700px){.cal{padding:16px} .week{grid-template-columns:1fr;min-width:0} .day{min-height:0}}
 .ev{display:block;background:var(--panel2);border-left:3px solid var(--accent);border-radius:8px;padding:8px 10px;text-decoration:none;color:var(--ink)}
 .ev.sel{background:var(--accent);color:var(--accent-ink)} .ev.none{background:transparent;border:1.5px dashed var(--line);color:var(--muted)}
 .ev.warn{border-left-color:#f59e0b}"""
