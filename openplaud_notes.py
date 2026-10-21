@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import threading
 import urllib.parse
@@ -18,8 +19,10 @@ from pathlib import Path
 import plaud_ai as pa
 
 # Names start with a letter or digit (any script), so none is hidden or "..". Folder names can't end in .md.
-FOLDER_NAME = re.compile(r"(?!.*\.md$)[^\W_][\w .-]{0,59}", re.I)
-PATH_PART = re.compile(r"[^\W_][\w .-]{0,199}")
+# Combining accents are allowed (é written as e + accent); Hangul fillers, which show as nothing, are not.
+_NAME_CHARS = r"(?:(?![\u115f\u1160\u3164\uffa0])[\w\u0300-\u036f .-])"
+FOLDER_NAME = re.compile(r"(?!.*\.md$)(?![\u115f\u1160\u3164\uffa0])[^\W_]" + _NAME_CHARS + "{0,59}", re.I)
+PATH_PART = re.compile(r"(?![\u115f\u1160\u3164\uffa0])[^\W_]" + _NAME_CHARS + "{0,199}")
 # Every change to the notes folder (moves, renames, ticks) happens one at a time.
 NOTES_LOCK = threading.RLock()
 ACTION_LINE = re.compile(r"^\s*[-*]\s+\[( |x|X)\]\s+(.*)$")
@@ -123,19 +126,20 @@ def move_history(root: Path, limit: int = 50) -> list[dict]:
 def _place(src: Path, wanted: Path) -> Path:
     """Move a file to `wanted`, or to the first free -2, -3… name beside it. Never replaces a file: the new
     name is claimed with a hard link (which fails if the name exists) before the old one is removed."""
-    while True:
+    for _ in range(1000):
         target = pa.unique_path(wanted)
         try:
             os.link(src, target)
         except FileExistsError:
             continue
         except OSError:  # a filesystem without hard links: fall back to a checked rename (under NOTES_LOCK)
-            if target.exists():
+            if os.path.lexists(target):
                 continue
             src.rename(target)
             return target
         src.unlink()
         return target
+    raise ValueError(f"Couldn't find a free name for {wanted.name}.")
 
 
 def move_note(root: Path, note: Path, folder: Path) -> tuple[Path, str]:
@@ -220,9 +224,14 @@ def set_action(path: Path, line_no: int, expected: str, done: bool) -> bool:
             return False
         lines[line_no] = re.sub(r"\[( |x|X)\]", "[x]" if done else "[ ]", lines[line_no], count=1)
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
-        with os.fdopen(fd, "w", newline="") as f:
-            f.write("\n".join(lines))
-        os.replace(tmp, path)
+        try:
+            os.fchmod(fd, stat.S_IMODE(path.stat().st_mode))  # keep the note's own permissions
+            with os.fdopen(fd, "w", newline="") as f:
+                f.write("\n".join(lines))
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)  # only our own unfinished temporary file
         return True
 
 

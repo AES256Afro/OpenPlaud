@@ -310,3 +310,57 @@ class SweepOne(unittest.TestCase):
             cr.normalize_url = old
             server.shutdown()
         self.assertEqual(outcomes, [False, False, True, False])
+
+
+class SweepTwo(unittest.TestCase):
+    def test_a_damaged_state_is_recovered_and_stays_recovered(self):
+        pa.save_state({"processed": {"r1": {"file": "x"}}})
+        pa.save_state({"processed": {"r1": {"file": "x"}, "r2": {"file": "y"}}})
+        pa.STATE_PATH.write_text("{half")
+        self.assertIn("r1", pa.load_state()["processed"])
+        self.assertIn("r1", pa.load_state()["processed"])  # the second load reads the recovered file
+        pa.save_state(pa.load_state())
+        pa.save_state(pa.load_state())
+        self.assertIn("r1", pa.load_state()["processed"])
+
+    def test_ticks_keep_file_permissions_and_leave_no_temp_files(self):
+        root = Path(tempfile.mkdtemp())
+        note = root / "n.md"
+        note.write_text("- [ ] Sam: call\n")
+        note.chmod(0o644)
+        self.assertTrue(nt.set_action(note, 0, "Sam: call", True))
+        self.assertEqual(note.stat().st_mode & 0o777, 0o644)
+        self.assertEqual([p.name for p in root.iterdir()], ["n.md"])
+
+    def test_urls_never_show_credentials(self):
+        self.assertEqual(pa.redact_url("http://user:s3cret@10.0.0.2:11434/v1?key=abc"), "http://10.0.0.2:11434/v1")
+        os.environ["PLAUD_CLIENT_SECRET"] = "plaud-own"
+        os.environ["OLLAMA_URL"] = "http://u:p@box:11434"
+        env = pa.plaud_env()
+        self.assertIn("PLAUD_CLIENT_SECRET", env)
+        self.assertNotIn("OLLAMA_URL", env)
+
+    def test_more_real_host_names(self):
+        for ok in ["mac-mini.local:8795", "box.tail1.ts.net.", "notes.example.org:443"]:
+            self.assertTrue(core.host_allowed({"Host": ok}, "notes.example.org:443,other.example"), ok)
+        self.assertFalse(core.host_allowed({"Host": "evil.example"}, "notes.example.org"))
+
+    def test_odd_unicode_names(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        self.assertIsNotNone(nt.inside(root, "été.md"))
+        self.assertIsNone(nt.inside(root, "Workㅤ"))
+        self.assertIsNone(nt.inside(root, "‮evil.md"))
+
+    def test_dangling_links_count_as_taken_names(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "a.md").symlink_to(root / "missing")
+        self.assertEqual(pa.write_new(root / "a.md", "x").name, "a-2.md")
+
+    def test_the_right_password_never_waits_behind_wrong_guesses(self):
+        import threading
+        pw = core.Passwords("secret", b"salt:")
+        threading.Thread(target=pw.check, args=("wrong",)).start()
+        time.sleep(0.05)
+        start = time.time()
+        self.assertTrue(pw.check("secret"))
+        self.assertLess(time.time() - start, 0.5)

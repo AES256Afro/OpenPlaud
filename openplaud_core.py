@@ -186,11 +186,11 @@ class Passwords:
     def check(self, given: str) -> bool:
         """Compare a typed password. Wrong guesses are answered one at a time, a second apart, however many
         connections send them, so guessing can't be sped up by sending in parallel."""
-        with Passwords._guard:
-            ok = bool(self.password) and hmac.compare_digest(given.encode(), self.password.encode())
-            if not ok:
-                time.sleep(1)
-            return ok
+        if bool(self.password) and hmac.compare_digest(given.encode(), self.password.encode()):
+            return True
+        with Passwords._guard:  # only wrong guesses wait in line; the right password never does
+            time.sleep(1)
+        return False
 
     def make(self) -> str:
         expires = str(int(time.time()) + self.days * 86400)
@@ -236,19 +236,27 @@ def host_allowed(headers, extra: str = "") -> bool:
     """Whether the request names this server: an IP address, localhost, a single-label (MagicDNS) name, a
     tailnet name (*.ts.net) or a host listed in `extra` (comma-separated). Refuses DNS-rebinding pages, which
     reach the server under the attacker's own domain name."""
-    allowed = {h.strip().lower() for h in (extra or os.environ.get("OPENPLAUD_ALLOWED_HOSTS", "")).split(",") if h.strip()}
+    allowed = {_hostname(h) for h in (extra or os.environ.get("OPENPLAUD_ALLOWED_HOSTS", "")).split(",") if h.strip()}
     for value in (headers.get("Host"), headers.get("X-Forwarded-Host")):
         if value is None:
             continue
-        host = urllib.parse.urlsplit("//" + value.strip()).hostname or ""
-        if not _host_ok(host, allowed):
+        if not _host_ok(_hostname(value), allowed):
             return False
     return True
 
 
+def _hostname(value: str) -> str:
+    try:
+        return (urllib.parse.urlsplit("//" + value.strip()).hostname or "").rstrip(".")
+    except ValueError:
+        return ""
+
+
 def _host_ok(host: str, allowed: set) -> bool:
-    if host in allowed or host in ("localhost",) or host.endswith((".ts.net", ".localhost")) or "." not in host:
-        return bool(host)
+    if not host:
+        return False
+    if host in allowed or host == "localhost" or host.endswith((".ts.net", ".localhost", ".local")) or "." not in host:
+        return True
     try:
         ipaddress.ip_address(host)
         return True

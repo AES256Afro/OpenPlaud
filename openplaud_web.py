@@ -87,6 +87,12 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
     if not claude_on():
         return
     rid, name = pa.rec_id(rec), str(rec.get("name") or pa.rec_id(rec))
+    try:
+        text = cr.build_payload(name, pa.recorded_at(rec).strftime("%Y-%m-%d %H:%M") if pa.recorded_at(rec) else "?",
+                                pa.duration(rec), rid, [("Notes written by OpenPlaud", note_path.read_text())], transcript)
+    except OSError as err:
+        log(f"✗ Claude: {name}: couldn't read its note ({err.__class__.__name__}); not sent")
+        return
     with pa.editing_state() as state:
         c = claude_state(state)
         if not manual:
@@ -105,8 +111,6 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
         budget.spend()
         c["fires"] = budget.stamps
         c["inflight"][rid] = {"at": datetime.now().isoformat()}
-    text = cr.build_payload(name, pa.recorded_at(rec).strftime("%Y-%m-%d %H:%M") if pa.recorded_at(rec) else "?",
-                            pa.duration(rec), rid, [("Notes written by OpenPlaud", note_path.read_text())], transcript)
     result, failure = None, None
     try:
         result = cr.fire(CLAUDE_URL, CLAUDE_TOKEN, text)
@@ -693,6 +697,10 @@ class Handler(BaseHTTPRequestHandler):
             restored = nt.undo_move(root, form.get("id", ""))
             if not restored:
                 return self._redirect(back, "That move can't be undone: what it moved isn't where it was put any more.")
+            if restored.is_file() and back.startswith("/notes/"):
+                back = nt.note_url(root, restored)
+            elif restored.is_file() and "note=" in back:
+                back = "/?" + urllib.parse.urlencode({"note": nt.rel_of(root, restored)})
             return self._redirect(back, f"Put back as {nt.rel_of(root, restored)}.")
         if path in ("/folders/rename", "/folders/move"):
             root = pa.notes_dir(pa.load_config())

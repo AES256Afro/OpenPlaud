@@ -132,22 +132,32 @@ STATE_LOCK = threading.RLock()
 
 
 def _read_state(path: Path) -> dict | None:
+    """The state in `path`; None when it is damaged. A read error (not damage) is raised, never treated as damage."""
     try:
         state = json.loads(path.read_text())
-    except (OSError, ValueError):
+    except ValueError:
         return None
     return state if isinstance(state, dict) else None
 
 
 def load_state() -> dict:
     with STATE_LOCK:
+        bak = STATE_PATH.with_name(STATE_PATH.name + ".bak")
         if not STATE_PATH.exists():
-            return {"processed": {}}
-        state = _read_state(STATE_PATH)
-        if state is None:
-            # Keep the damaged file for inspection (nothing is deleted) and fall back to the copy kept before the last save.
-            STATE_PATH.rename(STATE_PATH.with_name(f"{STATE_PATH.name}.damaged-{datetime.now():%Y%m%d-%H%M%S}"))
-            state = _read_state(STATE_PATH.with_name(STATE_PATH.name + ".bak")) or {}
+            if not bak.exists():
+                return {"processed": {}}
+            state = _read_state(bak) or {}
+            save_state(state)
+        else:
+            state = _read_state(STATE_PATH)
+            if state is None:
+                # Keep the damaged file for inspection (nothing is deleted), recover the copy kept before the last
+                # save, and write it back straight away so the next load doesn't start from nothing.
+                STATE_PATH.rename(unique_path(STATE_PATH.with_name(f"{STATE_PATH.name}.damaged-{datetime.now():%Y%m%d-%H%M%S}")))
+                state = (_read_state(bak) if bak.exists() else None) or {}
+                state.setdefault("processed", {})
+                with open(STATE_PATH, "x") as f:
+                    f.write(json.dumps(state, indent=2))
         state.setdefault("processed", {})
         return state
 
@@ -158,15 +168,19 @@ def save_state(state: dict) -> None:
     with STATE_LOCK:
         data = json.dumps(state, indent=2)
         fd, tmp = tempfile.mkstemp(dir=STATE_PATH.parent, prefix=STATE_PATH.name + ".", suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        if STATE_PATH.exists():
-            bak = STATE_PATH.with_name(STATE_PATH.name + ".bak")
-            shutil.copyfile(STATE_PATH, bak.with_suffix(".bak.tmp"))
-            os.replace(bak.with_suffix(".bak.tmp"), bak)
-        os.replace(tmp, STATE_PATH)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            if STATE_PATH.exists() and _read_state(STATE_PATH) is not None:
+                bak = STATE_PATH.with_name(STATE_PATH.name + ".bak")
+                shutil.copyfile(STATE_PATH, bak.with_suffix(".bak.tmp"))
+                os.replace(bak.with_suffix(".bak.tmp"), bak)
+            os.replace(tmp, STATE_PATH)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)  # only our own unfinished temporary file
 
 
 @contextmanager
@@ -231,7 +245,13 @@ SECRET_ENV = re.compile(r"API_KEY|_KEY$|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL"
 
 def plaud_env() -> dict:
     """The environment for the Plaud server process: everything except this app's keys, tokens and passwords."""
-    return {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    def keep(name: str, value: str) -> bool:
+        if name.startswith("PLAUD_") and not name.startswith("PLAUD_AI_"):
+            return True  # Plaud's own settings (endpoints, its client secret)
+        if SECRET_ENV.search(name):
+            return False
+        return not ("://" in value and "@" in value)  # an address with credentials in it
+    return {k: v for k, v in os.environ.items() if keep(k, v)}
 
 
 class Plaud:
@@ -477,6 +497,21 @@ class CapReached(Exception):
     pass
 
 
+class Unpriced(CapReached):
+    """A cap is set and this one model can't be priced: only its recordings wait."""
+
+
+def redact_url(url: str) -> str:
+    """An address without any password, user name or query string in it (those can hold keys)."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        host = u.hostname or ""
+        host = f"[{host}]" if ":" in host else host
+        return f"{u.scheme}://{host}{f':{u.port}' if u.port else ''}{u.path.rstrip('/')}"
+    except ValueError:
+        return "(address hidden)"
+
+
 class LocalBackend:
     """Ollama (native API, so context size can be set) or any OpenAI-compatible server."""
     paid = False
@@ -484,9 +519,7 @@ class LocalBackend:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.base = cfg["base_url"].rstrip("/")
-        shown = urllib.parse.urlsplit(self.base)
-        # Never show a password or key that is part of the address.
-        self.name = f"{cfg['model']} @ {shown.scheme}://{shown.hostname or ''}{f':{shown.port}' if shown.port else ''}{shown.path.rstrip('/')}"
+        self.name = f"{cfg['model']} @ {redact_url(self.base)}"
         self.usage = Usage()
 
     def max_input_tokens(self) -> int:
@@ -528,10 +561,10 @@ class LocalBackend:
         try:
             return http_json(url, body, headers, self.cfg["timeout"])
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"The local model at {url} answered {e.code}: {e.read().decode(errors='replace')[:200]}") from None
+            raise RuntimeError(f"The local model at {redact_url(url)} answered {e.code}: {e.read().decode(errors='replace')[:200]}") from None
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise RuntimeError(
-                f"Could not reach local model at {url} ({e}). Is Tailscale up and the server running?"
+                f"Could not reach local model at {redact_url(url)} ({e}). Is Tailscale up and the server running?"
             ) from None
 
     def check(self) -> str:
@@ -751,26 +784,27 @@ def slug(s: str) -> str:
 
 def unique_path(path: Path) -> Path:
     """`path`, or the first free `name-2.md`, `name-3.md`…: a note is never written over another."""
-    if not path.exists():
+    if not os.path.lexists(path):
         return path
     n = 2
     while True:
         candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             return candidate
         n += 1
 
 
 def write_new(path: Path, text: str) -> Path:
     """Write a new file under a name nobody has: an existing file is never replaced, even by a racing writer."""
-    while True:
-        path = unique_path(path)
+    for _ in range(1000):
+        target = unique_path(path)
         try:
-            with path.open("x") as f:
+            with target.open("x") as f:
                 f.write(text)
-            return path
+            return target
         except FileExistsError:
             continue
+    raise RuntimeError(f"Couldn't find a free name for {path.name}.")
 
 
 def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr,
@@ -783,7 +817,7 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     transcript = apply_speakers(transcript, load_state().get("speakers", {}).get(fid))
     cap = float(os.environ.get("OPENPLAUD_MONTHLY_CAP", "0") or 0)
     if cap and getattr(backend, "paid", False) and not priced(backend):
-        raise CapReached(f"A monthly cap is set, but OpenPlaud has no price for {backend.name}, so it can't keep that model "
+        raise Unpriced(f"A monthly cap is set, but OpenPlaud has no price for {backend.name}, so it can't keep that model "
                          "under the cap. Pick a Claude model or the local model, or remove the cap.")
     if cap and getattr(backend, "paid", False) and month_spend() >= cap:
         raise CapReached(f"This month's spending cap (${cap:.2f}) is reached; paid runs wait for next month or a higher cap.")
@@ -854,6 +888,10 @@ def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir
                                       on_done=on_done)
         except NotSignedIn:
             raise
+        except Unpriced as e:
+            record_failure(rec_id(rec), e)
+            log(f"… {rec.get('name', rec_id(rec))}: {e}")
+            continue
         except CapReached as e:
             log(f"… {e}")
             break
