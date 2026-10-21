@@ -59,7 +59,10 @@ class PlaudSession:
         except pa.NotSignedIn:
             who = None
         except (pa.PlaudError, ValueError, AttributeError):
-            return who  # a passing error: keep what we knew rather than showing "signed out" for 5 minutes
+            # Keep what we knew rather than showing "signed out" for 5 minutes, but ask again in about a minute
+            # instead of on every page load.
+            self._user = (time.time() - 240, who)
+            return who
         finally:
             self.lock.release()
         self._user = (time.time(), who)
