@@ -461,3 +461,33 @@ class CheckClockTests(unittest.TestCase):
         local = datetime.fromisoformat(pa.received_at({"created_at": two_days_ago}))
         self.assertGreater((datetime.now() - local).total_seconds(), 47 * 3600)
         self.assertLess((datetime.now() - datetime.fromisoformat(pa.received_at({}))).total_seconds(), 5)
+
+
+class SetupProblems(unittest.TestCase):
+    def test_a_routine_token_in_the_api_key_field_is_named(self):
+        self.assertIn("sk-ant-oat", pa.claude_key_problem("sk-ant-oat01-" + "x" * 90))
+        self.assertIsNone(pa.claude_key_problem("sk-ant-api03-" + "x" * 90))
+        self.assertIsNone(pa.claude_key_problem(""))
+
+    def test_a_setup_problem_stops_the_check_without_failing_recordings(self):
+        class Broken:
+            name, paid, usage = "broken", False, None
+
+            def max_input_tokens(self):
+                return 100_000
+
+            def complete(self, system, user):
+                raise pa.SetupProblem("fix the key")
+        recs = [{"id": f"r{i}", "name": f"R{i}", "start_at": "2026-10-21T10:00:00", "duration": 60000} for i in range(3)]
+        pa.save_state({"processed": {}})
+        old = (pa.list_recordings, pa.fetch_transcript)
+        pa.list_recordings = lambda *a: recs
+        pa.fetch_transcript = lambda p, rid: "[00:00 - 00:04] Sam: hi"
+        logs = []
+        try:
+            written, failures = pa.sync(None, Broken(), 7, "notes", "summary", Path(tempfile.mkdtemp()), log=logs.append)
+        finally:
+            pa.list_recordings, pa.fetch_transcript = old
+        self.assertEqual((written, failures), ([], 0))
+        self.assertEqual(pa.load_state().get("failed", {}), {})
+        self.assertTrue(any("fix the key" in line for line in logs))

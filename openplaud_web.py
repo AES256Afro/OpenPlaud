@@ -535,6 +535,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         "show": show if show in FILTERS else "", "q": query.get("q", ""), "search": search, "undo": query.get("undo", ""),
         "all_recordings": all_recordings, "moves": nt.move_history(root, 10),
         "models": model_choices(cfg), "prompts": sorted(saved_prompts()), "spend": pa.month_spend(state), "cap": MONTHLY_CAP,
+        "setup_problem": pa.claude_key_problem() if cfg["backend"] == "claude" else None,
         "unpriced_runs": state.get("usage", {}).get(datetime.now().strftime("%Y-%m"), {}).get("unpriced_runs", 0),
         "health": core.plaud_health() if plaud_state["state"] == "signed_in" else None,
         "speakers": speakers_for(nt.plaud_id(selected["text"])) if selected and look == "reader" else None,

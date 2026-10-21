@@ -835,6 +835,9 @@ RENDERERS = {"inbox": look_inbox, "timeline": look_timeline, "actions": look_act
 def dashboard(ctx: dict) -> str:
     body, css = RENDERERS[ctx["look"]](ctx)
     bar = topbar(ctx)
+    if ctx.get("setup_problem"):
+        bar += (f'<div role="alert" style="padding:12px 20px;background:var(--warn-bg);color:var(--warn-ink);'
+                f'border-bottom:1px solid var(--line)"><strong>Notes can\'t be written yet.</strong> {e(ctx["setup_problem"])}</div>')
     if ctx.get("search") is not None:
         bar = bar.replace('</div><section class="panel"', '</div><div class="searchwrap"><section class="panel"', 1) + "</div>"
     return page(ctx, "OpenPlaud", bar + body + palette(ctx), css + PALETTE_CSS, poll=ctx["busy"] or ctx["plaud"]["state"] == "waiting")

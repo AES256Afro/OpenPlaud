@@ -544,6 +544,10 @@ class CapReached(Exception):
     pass
 
 
+class SetupProblem(CapReached):
+    """A setting is wrong (say, the API key): the check stops with one clear message instead of failing every recording."""
+
+
 class Unpriced(CapReached):
     """A cap is set and this one model can't be priced: only its recordings wait."""
 
@@ -622,6 +626,16 @@ class LocalBackend:
         return f"{self.name}: model {status}"
 
 
+def claude_key_problem(key: str | None = None) -> str | None:
+    """What is wrong with the Claude API key setting, if something visibly is."""
+    key = (os.environ.get("ANTHROPIC_API_KEY", "") if key is None else key).strip()
+    if key.startswith("sk-ant-oat"):
+        return ("The Claude API key setting holds a Claude Code token (it starts with sk-ant-oat), which can only start a "
+                "scheduled task. Writing notes needs an API key from console.anthropic.com (it starts with sk-ant-api): put "
+                "one in OpenPlaud › Settings › Claude API key, or switch the model provider to local.")
+    return None
+
+
 NO_CLAUDE_CREDS = ("No Claude credentials. Put ANTHROPIC_API_KEY=... in the .env file next to plaud_ai.py "
                    "(create a key at console.anthropic.com).")
 # Models that accept server-side refusal fallback; Haiku has none.
@@ -651,6 +665,11 @@ class ClaudeBackend:
             raise
 
     def _complete(self, system: str, user: str) -> str:
+        import anthropic
+
+        problem = claude_key_problem()
+        if problem:
+            raise SetupProblem(problem)
         params = dict(
             model=self.cfg["model"],
             max_tokens=self.cfg["max_tokens"],
@@ -664,8 +683,12 @@ class ClaudeBackend:
             )
         else:
             stream = self.client.messages.stream(**params)
-        with stream as s:
-            msg = s.get_final_message()
+        try:
+            with stream as s:
+                msg = s.get_final_message()
+        except anthropic.AuthenticationError:
+            raise SetupProblem("Claude rejected the API key (401). Put a current API key from console.anthropic.com in "
+                               "OpenPlaud › Settings › Claude API key.") from None
         used_in, used_out = getattr(msg.usage, "input_tokens", 0) or 0, getattr(msg.usage, "output_tokens", 0) or 0
         self.usage.add(used_in, used_out, model_cost(self.cfg["model"], used_in, used_out))
         if msg.stop_reason == "refusal":
