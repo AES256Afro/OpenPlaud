@@ -306,7 +306,7 @@ def account_bits(ctx: dict) -> str:
                 else f' <span class="muted">· sign-in good until {e(h["until"])} (renews itself)</span>')
     signout = '<form class="inline" method="post" action="/plaud/signout"><button class="btn small">Sign out of Plaud</button></form>' if p["state"] == "signed_in" else ""
     test = f'<form class="inline" method="post" action="/test"><button class="btn small">Test {e(ctx["provider"])}</button></form>'
-    logout = '<form class="inline" method="post" action="/logout"><button class="btn small">Lock</button></form>' if ctx["password"] else ""
+    logout = '<form class="inline" method="post" action="/logout"><button class="btn small" title="Signs out every browser and phone">Lock</button></form>' if ctx["password"] else ""
     claude = f'<a class="btn small" href="/claude">Claude: {"on" if ctx.get("claude_on") else "set up"}</a>'
     spend = ""
     cap_text = f" of ${ctx['cap']:.2f}" if ctx.get("cap") else ""
