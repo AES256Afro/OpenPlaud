@@ -53,6 +53,11 @@ def contents(notes: Path) -> dict[str, str]:
     return {str(p.relative_to(notes)): hashlib.sha256(p.read_bytes()).hexdigest() for p in notes.rglob("*.md")}
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -80,7 +85,7 @@ class EndToEnd(unittest.TestCase):
                 break
             except OSError:
                 time.sleep(0.1)
-        jar = http.cookiejar.CookieJar()
+        cls.jar = jar = http.cookiejar.CookieJar()
         cls.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         cls.jar = jar
         cls.post("/login", password="test-password")
@@ -217,6 +222,32 @@ class EndToEnd(unittest.TestCase):
         page = self.get("/notes/" + urllib.parse.quote(moved), look="reader").read().decode()
         self.assertIn("Priya Patel", page)
         self.assertIn('value="Priya Patel"', page)
+
+        # Clearing one speaker's name while naming another works (blank fields are kept).
+        self.post("/speakers", id="rec_sync", **{"label": "Priya", "name": ""}, back="/")
+        page = self.get("/notes/" + urllib.parse.quote(moved), look="reader").read().decode()
+        self.assertNotIn("Priya Patel", page)
+
+        # Hostile requests: a negative body length, a rebinding host name, a crafted back address.
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest("POST", "/sync")
+        conn.putheader("Content-Length", "-1")
+        conn.putheader("Sec-Fetch-Site", "same-origin")
+        conn.endheaders()
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/", headers={"Host": "evil.example:8795"})
+        self.assertEqual(conn.getresponse().status, 421)
+        conn.close()
+        req = urllib.request.Request(self.base + "/look", urllib.parse.urlencode({"look": "inbox", "back": "/\\evil.example"}).encode(),
+                                     {"Sec-Fetch-Site": "same-origin"})
+        opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPCookieProcessor(self.jar))
+        try:
+            opener.open(req, timeout=10)
+        except urllib.error.HTTPError as err:
+            self.assertEqual(err.headers["Location"], "/")
 
         # The activity log is kept on disk.
         self.assertIn("Sync finished", (self.data / "activity.log").read_text())

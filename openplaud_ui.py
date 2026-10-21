@@ -6,6 +6,7 @@ The server builds one context dict per request (see openplaud_web.build_context)
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import urllib.parse
@@ -74,12 +75,12 @@ THEMES = {
 STATUS = {
     "ready": ("Notes ready", "ok"), "filed": ("Filed", "info"), "writing": ("Writing notes…", "warn"),
     "queued": ("Queued", "warn"), "no_transcript": ("No transcript yet", "none"), "new": ("New", "info"),
-    "failed": ("Failed · retried next sync", "warn"),
+    "failed": ("Failed · retried next sync", "warn"), "stuck": ("Failed 5 times · run it by hand", "warn"),
 }
 FILTER_TESTS = {
     "": lambda r: True, "unread": lambda r: r.get("unread"), "actions": lambda r: r.get("actions_open", 0) > 0,
     "new": lambda r: r["status"] in ("new", "queued", "writing"), "waiting": lambda r: r["status"] == "no_transcript",
-    "failed": lambda r: r["status"] == "failed" or bool(r.get("claude_error")), "filed": lambda r: r["status"] == "filed",
+    "failed": lambda r: r["status"] in ("failed", "stuck") or bool(r.get("claude_error")), "filed": lambda r: r["status"] == "filed",
 }
 FILTER_LABELS = [("", "All"), ("unread", "Unread"), ("actions", "Has action items"), ("new", "No notes yet"),
                  ("waiting", "Waiting on Plaud"), ("failed", "Failed"), ("filed", "Filed")]
@@ -206,7 +207,7 @@ def sync_text(ctx: dict) -> str:
 def badge(rec: dict) -> str:
     label, kind = STATUS.get(rec["status"], (rec["status"], "none"))
     unread = '<span class="badge info">Unread</span> ' if rec.get("unread") else ""
-    title = f' title="{e(rec["error"])}"' if rec.get("error") and rec["status"] == "failed" else ""
+    title = f' title="{e(rec["error"])}"' if rec.get("error") and rec["status"] in ("failed", "stuck") else ""
     return f'{unread}<span class="badge {kind}"{title}>{e(label)}</span>'
 
 
@@ -232,9 +233,14 @@ def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
             f'<button class="btn{" small" if compact else ""}">{label}</button></form>')
 
 
+def safe_url(url) -> bool:
+    """Only https links from outside (Claude sessions, the Plaud sign-in page) become clickable."""
+    return isinstance(url, str) and url.startswith("https://")
+
+
 def claude_bits(ctx: dict, rec: dict) -> str:
     """Where this recording stands with Claude: a link to its session, or a button to send it."""
-    if rec.get("claude_url"):
+    if safe_url(rec.get("claude_url")):
         return f'<a class="btn small" href="{e(rec["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude ↗</a>'
     if not ctx.get("claude_on"):
         return ""
@@ -270,7 +276,7 @@ def plaud_panel(ctx: dict) -> str:
     if p["state"] == "waiting":
         msg = f'<p style="color:var(--bad-ink)">{e(p["message"])}</p>' if p.get("message") else ""
         return f"""<div class="panel" style="margin-bottom:14px"><h2 style="margin-top:0">Sign in to Plaud</h2>
-<ol><li><a class="btn primary" href="{e(p['url'])}" target="_blank" rel="noopener noreferrer">Open the Plaud sign-in page</a> and approve access.</li>
+<ol><li>{f'<a class="btn primary" href="{e(p["url"])}" target="_blank" rel="noopener noreferrer">Open the Plaud sign-in page</a>' if safe_url(p.get("url")) else "Plaud's sign-in link looks wrong; start again"} and approve access.</li>
 <li>Your browser then goes to a <code>localhost:8199</code> address that doesn't load. That's expected. Copy that whole address and paste it here within 2 minutes:</li></ol>
 <form method="post" action="/plaud/callback"><input type="text" name="url" placeholder="http://localhost:8199/auth/callback?code=…" required autofocus style="width:100%">
 <p><button class="btn primary">Finish signing in</button></p></form>{msg}</div>"""
@@ -410,11 +416,16 @@ def actions_list(ctx: dict, limit: int | None = None, show_done: bool = False) -
         f'<input type="hidden" name="note" value="{e(a["note_rel"])}"><input type="hidden" name="line" value="{a["line"]}">'
         f'<input type="hidden" name="text" value="{e(a["text"])}"><input type="hidden" name="done" value="{"0" if a["done"] else "1"}">'
         f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}">'
-        f'<input type="checkbox" id="act-{i}"{" checked" if a["done"] else ""} onchange="this.form.submit()" style="margin-top:4px;width:18px;height:18px">'
-        f'<label for="act-{i}"><span{done_style if a["done"] else ""}>{e(a["text"])}</span><br>'
+        f'<input type="checkbox" id="{e(act_id(a))}"{" checked" if a["done"] else ""} onchange="this.form.submit()" style="margin-top:4px;width:18px;height:18px">'
+        f'<label for="{e(act_id(a))}"><span{done_style if a["done"] else ""}>{e(a["text"])}</span><br>'
         f'<span class="muted" style="font-size:13px">from <a href="{e(a["note_url"])}">{e(a["note_title"])}</a></span></label>'
         f'<noscript><button class="btn small">{"Reopen" if a["done"] else "Done"}</button></noscript></form>'
-        for i, a in enumerate(items))
+        for a in items)
+
+
+def act_id(a: dict) -> str:
+    """A page-wide unique id for one action item's checkbox: its note and line."""
+    return "act-" + hashlib.sha1(f'{a["note_rel"]}:{a["line"]}'.encode()).hexdigest()[:10]
 
 
 def render_markdown(md: str) -> str:
@@ -517,7 +528,8 @@ def look_inbox(ctx):
 <div class="row"><a class="btn small" href="{e(n['url'])}">Open</a><a class="btn small" href="{e(n['url'])}?raw=1">Download</a>{move_form(ctx, n['rel'], n['folder'])}</div></div>
 <div class="note">{n['html']}</div>"""
     else:
-        reading = f'<h2 style="margin-top:0">{breadcrumbs(ctx)}</h2>{folders_here(ctx)}{notes_list(ctx)}<div style="margin-top:12px">{new_folder_form(ctx)}</div>'
+        reading = (f'<h2 style="margin-top:0">{breadcrumbs(ctx)}</h2>{folders_here(ctx)}{notes_list(ctx)}<div style="margin-top:12px">{new_folder_form(ctx)}</div>'
+                   f'{folder_tools(ctx)}{recent_moves(ctx)}')
     body = f"""{header_bar(ctx)}<div class="inbox"><nav aria-label="Folders"><div class="muted" style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;padding:0 10px 6px">Folders</div>
 {folder_nav(ctx)}<div style="margin-top:14px">{activity(ctx, open_=False)}</div><div style="margin-top:10px">{account_bits(ctx)}</div></nav>
 <section class="list" aria-label="Recordings">{listing}</section>
@@ -564,7 +576,7 @@ def look_actions(ctx):
     week_ago = date.today() - timedelta(days=7)
     this_week = [a for a in open_items if a["day"] and a["day"] >= week_ago]
     older = [a for a in open_items if not (a["day"] and a["day"] >= week_ago)]
-    attention = [r for r in ctx["recordings"] or [] if r["status"] in ("new", "no_transcript", "writing", "queued")]
+    attention = [r for r in ctx["recordings"] or [] if r["status"] in ("failed", "stuck", "new", "no_transcript", "writing", "queued")]
 
     def group(title, items):
         return f'<div class="group">{e(title)}</div>' + (actions_list(dict(ctx, actions=items)) if items else '<p class="muted">None.</p>')
@@ -576,7 +588,7 @@ def look_actions(ctx):
 <div class="tile"><span class="muted">Notes</span><b>{ctx['counts']['notes']}</b></div>
 <div class="tile"><span class="muted">Need attention</span><b style="color:var(--warn-ink)">{len(attention)}</b></div></div>
 {flash(ctx)}{plaud_panel(ctx)}<div class="cols"><section class="main panel">{group('FROM THE LAST 7 DAYS', this_week)}{group('EARLIER', older)}
-<p class="muted" style="font-size:13px">Action items are read from your notes. Checking them off here is coming in v0.3.0; for now they mirror each note.</p></section>
+<p class="muted" style="font-size:13px">Action items are read from your notes. Ticking one here ticks it in the note.</p></section>
 <aside><section class="panel"><strong>Recordings needing attention</strong><ul class="plain" style="margin-top:8px">{''.join(f'<li style="padding:6px 0">{e(r["name"])} {badge(r)}</li>' for r in attention) or '<li class="muted">Nothing waiting.</li>'}</ul></section>
 {activity(ctx, open_=False)}<div class="panel">{account_bits(ctx)}</div></aside></div>
 <h2 style="margin-top:28px;font-size:18px">Recordings · last {ctx['list_days']} days</h2><div class="panel">{recordings_table(ctx)}</div>
@@ -619,7 +631,7 @@ def palette(ctx: dict) -> str:
             cmds.append(f'<li data-k="open notes {name}"><a href="{e(r["note_url"])}">Open notes: {e(r["name"])}</a></li>')
         cmds.append(f'<li data-k="run {name}"><form method="post" action="/process"><input type="hidden" name="id" value="{e(r["id"])}">'
                     f'<input type="hidden" name="task" value="{e(ctx["default_task"])}"><button>Run: {e(r["name"])}</button></form></li>')
-        if r.get("claude_url"):
+        if safe_url(r.get("claude_url")):
             cmds.append(f'<li data-k="claude open {name}"><a href="{e(r["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude: {e(r["name"])}</a></li>')
         elif ctx.get("claude_on"):
             cmds.append(f'<li data-k="claude send {name}"><form method="post" action="/claude/send"><input type="hidden" name="id" value="{e(r["id"])}">'
@@ -650,18 +662,18 @@ def look_command(ctx):
 
 
 def look_board(ctx):
-    css = """.bd{padding:22px} .cols{display:grid;grid-template-columns:repeat(5,minmax(220px,1fr));gap:14px;overflow-x:auto}
+    css = """.bd{padding:22px} .cols{display:grid;grid-template-columns:repeat(6,minmax(220px,1fr));gap:14px;overflow-x:auto}
 .col{background:var(--panel2);border-radius:var(--radius);padding:12px;min-height:200px} .col h2{font-size:14px;margin:2px 4px 12px;display:flex;justify-content:space-between}
 .col .card{margin-bottom:10px;padding:12px}"""
-    columns = [("New", ["new"]), ("Waiting on Plaud", ["no_transcript"]), ("Writing", ["writing", "queued"]), ("Ready to file", ["ready"]), ("Filed", ["filed"])]
+    columns = [("Failed", ["failed", "stuck"]), ("New", ["new"]), ("Waiting on Plaud", ["no_transcript"]), ("Writing", ["writing", "queued"]), ("Ready to file", ["ready"]), ("Filed", ["filed"])]
     cols = []
     for title, kinds in columns:
         recs = [r for r in ctx["recordings"] or [] if r["status"] in kinds]
         cards = []
         for r in recs:
             extra = ""
-            if r["status"] in ("new", "no_transcript"):
-                extra = run_form(ctx, r, compact=True)
+            if r["status"] in ("new", "no_transcript", "failed", "stuck"):
+                extra = (f'<div class="muted" style="font-size:12px;margin-bottom:6px">{e(r["error"])}</div>' if r.get("error") else "") + run_form(ctx, r, compact=True)
             elif r["status"] in ("ready", "filed") and r.get("note_rel"):
                 extra = move_form(ctx, r["note_rel"], r.get("note_folder", ""))
             cards.append(f'<div class="card"><div style="font-weight:700">{open_link(ctx, r)}</div><div class="muted" style="font-size:13px;margin:4px 0 8px">'
