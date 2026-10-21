@@ -27,6 +27,10 @@ import plaud_ai as pa
 
 PORT = int(os.environ.get("OPENPLAUD_PORT", "8795"))
 PASSWORD = os.environ.get("OPENPLAUD_PASSWORD", "")
+# A secret for POST /api/check (a phone shortcut or another service can start a check); empty turns it off.
+CHECK_TOKEN = os.environ.get("OPENPLAUD_CHECK_TOKEN", "").strip()
+# Opening the page starts a check when the last one is older than this many minutes; 0 turns it off.
+CHECK_ON_OPEN_MIN = float(os.environ.get("OPENPLAUD_CHECK_ON_OPEN", "5") or 0)
 SYNC_EVERY_MIN = int(os.environ.get("OPENPLAUD_SYNC_EVERY", "60") or 0)
 SYNC_DAYS = int(os.environ.get("OPENPLAUD_SYNC_DAYS", "7") or 7)
 LIST_DAYS = int(os.environ.get("OPENPLAUD_LIST_DAYS", "30") or 30)
@@ -150,7 +154,7 @@ class Jobs:
         self.pending: set[tuple] = set()
         self.adding = threading.Lock()
         self.last_sync: str | None = None
-        self.next_sync: datetime | None = None
+        self.clock = core.CheckClock(SYNC_EVERY_MIN)
         threading.Thread(target=self._worker, daemon=True).start()
         if SYNC_EVERY_MIN > 0:
             threading.Thread(target=self._scheduler, daemon=True).start()
@@ -185,13 +189,22 @@ class Jobs:
         with self.adding:
             return {job[1] for job in self.pending if job[0] in ("process", "claude")}
 
+    @property
+    def next_sync(self) -> datetime | None:
+        return self.clock.next_text()
+
     def _scheduler(self) -> None:
-        self.next_sync = datetime.now() + timedelta(seconds=30)
-        time.sleep(30)
         while True:
-            self.next_sync = datetime.now() + timedelta(minutes=SYNC_EVERY_MIN)
-            self.add(("sync",))
-            time.sleep(SYNC_EVERY_MIN * 60)
+            time.sleep(10)
+            if self.clock.take_due():
+                self.add(("sync",))
+
+    def check_on_open(self) -> bool:
+        """Opening the page starts a check when the last one is stale (and Plaud is signed in). True if it did."""
+        if CHECK_ON_OPEN_MIN and self.clock.stale(CHECK_ON_OPEN_MIN) and not self.current and self.queue.empty() \
+                and plaud.cached_user():
+            return self.add(("sync",))
+        return False
 
     def _worker(self) -> None:
         while True:
@@ -223,13 +236,18 @@ class Jobs:
         with plaud.lock:
             p = plaud.get()
             if job[0] == "sync":
-                self.say(f"Sync started (last {SYNC_DAYS} days, {backend.name})")
-                written, failures = pa.sync(p, backend, SYNC_DAYS, pa.TASKS[DEFAULT_TASK], DEFAULT_TASK, out_dir, log=self.say,
-                                            on_start=lambda rec: setattr(self, "active_id", pa.rec_id(rec)), on_done=self._on_done(),
-                                            pick=lambda rec: route(cfg, rec))
-                self.last_sync = datetime.now().strftime("%-d %b %H:%M")
-                self.say(f"Sync finished: {len(written)} new, {failures} failed")
-                self._retry_claude(p, out_dir)
+                try:
+                    self.say(f"Check started (last {SYNC_DAYS} days, {backend.name})")
+                    written, failures = pa.sync(p, backend, SYNC_DAYS, pa.TASKS[DEFAULT_TASK], DEFAULT_TASK, out_dir, log=self.say,
+                                                on_start=lambda rec: setattr(self, "active_id", pa.rec_id(rec)),
+                                                on_done=self._on_done(), pick=lambda rec: route(cfg, rec))
+                    self.last_sync = datetime.now().strftime("%-d %b %H:%M")
+                    self.say(f"Sync finished: {len(written)} new, {failures} failed")
+                    self._retry_claude(p, out_dir)
+                finally:
+                    self.clock.checked(waiting_since())
+                    if self.clock.quick_mode:
+                        self.say("… a recent recording is still waiting on Plaud; checking again in a few minutes")
             elif job[0] == "process":
                 _, file_id, task, spec, custom = job
                 instructions, label = instructions_for(task, custom)
@@ -272,6 +290,17 @@ class Jobs:
 
 jobs = Jobs()
 jobs.load_log()
+
+
+def waiting_since() -> list[float]:
+    """When each recording that still has no transcript was first seen without one."""
+    out = []
+    for value in pa.load_state().get("no_transcript", {}).values():
+        try:
+            out.append(datetime.fromisoformat(value).timestamp())
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def route(cfg: dict, rec: dict):
@@ -575,6 +604,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _trigger(self):
+        """POST /api/check with `Authorization: Bearer <OPENPLAUD_CHECK_TOKEN>`: start a check now. For phone
+        shortcuts and other services; it needs no page password or cookie, only the token."""
+        if not CHECK_TOKEN:
+            return self._send(404, "Not found", "text/plain")
+        if not core.host_allowed(self.headers) or not core.trigger_allowed(self.headers, CHECK_TOKEN):
+            return self._send(403, json.dumps({"error": "wrong or missing check token"}), "application/json")
+        queued = jobs.add(("sync",))
+        return self._send(202, json.dumps({"queued": queued, "already_queued": not queued}), "application/json")
+
     def _authed(self) -> bool:
         return passwords.valid(core.cookie(self.headers, COOKIE) or "")
 
@@ -607,7 +646,10 @@ class Handler(BaseHTTPRequestHandler):
         kept = {k: v for k, v in query.items() if k not in ("msg", "undo")}
         here = url.path + ("?" + urllib.parse.urlencode(kept) if kept else "")
         if path == "/":
-            return self._send(200, ui.dashboard(build_context(self._look(), query, query.get("msg"), here)))
+            ctx = build_context(self._look(), query, query.get("msg"), here)
+            if jobs.check_on_open():
+                ctx["busy"] = True
+            return self._send(200, ui.dashboard(ctx))
         if path == "/claude":
             return self._send(200, ui.claude_page(claude_context(self._look(), query.get("msg"))))
         if path == "/api/status":
@@ -639,6 +681,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        if path == "/api/check":
+            return self._trigger()
         if not core.same_origin(self.headers) or not core.host_allowed(self.headers):
             return self._send(403, "Cross-site request refused.", "text/plain")
         try:

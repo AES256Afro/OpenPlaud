@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -67,7 +68,7 @@ class EndToEnd(unittest.TestCase):
         cls.port = free_port()
         cls.log = open(cls.data / "server.log", "w+")
         env = dict(os.environ, OPENPLAUD_DATA=str(cls.data), OPENPLAUD_PORT=str(cls.port), OPENPLAUD_SYNC_EVERY="0",
-                   OPENPLAUD_PASSWORD="test-password", OPENPLAUD_PROVIDER="local",
+                   OPENPLAUD_PASSWORD="test-password", OPENPLAUD_PROVIDER="local", OPENPLAUD_CHECK_TOKEN="check-token-for-tests-123",
                    OLLAMA_URL=f"http://127.0.0.1:{cls.model.server_port}", LOCAL_MODEL="fake-model",
                    OPENPLAUD_PLAUD_COMMAND=json.dumps([sys.executable, str(ROOT / "tests" / "fake_plaud.py")]),
                    PLAUD_AI_CONFIG=str(cls.data / "none.toml"), HOME=str(cls.data))
@@ -257,6 +258,21 @@ class EndToEnd(unittest.TestCase):
         after = contents(notes)
         self.assertTrue(all(after.get(k) == v for k, v in before.items()))
         self.assertEqual(len(after), len(before) + 1)
+
+        # A phone shortcut can start a check with the token alone (no password or cookie); anything else is refused.
+        def trigger(token):
+            req = urllib.request.Request(self.base + "/api/check", b"", {"Authorization": f"Bearer {token}"} if token else {},
+                                         method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as err:
+                return err.code, None
+        self.assertEqual(trigger(None)[0], 403)
+        self.assertEqual(trigger("wrong-token-wrong-token")[0], 403)
+        status, body = trigger("check-token-for-tests-123")
+        self.assertEqual(status, 202)
+        self.assertIn("queued", body)
 
         # The activity log is kept on disk.
         self.assertIn("Sync finished", (self.data / "activity.log").read_text())

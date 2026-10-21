@@ -38,6 +38,8 @@ After that, recordings sync on a schedule, and each one can also be run by hand.
 | `OPENPLAUD_SYNC_EVERY` | Minutes between automatic syncs; `0` turns it off | `60` |
 | `OPENPLAUD_SYNC_DAYS` | How far back each sync looks, in days | `7` |
 | `OPENPLAUD_PASSWORD` | Password for the web page; empty means no password | |
+| `OPENPLAUD_CHECK_TOKEN` | Secret for the check trigger, `POST /api/check` (see below); empty turns the trigger off | |
+| `OPENPLAUD_CHECK_ON_OPEN` | Opening the page checks Plaud when the last check is older than this many minutes; `0` turns it off | `5` |
 | `OPENPLAUD_ALLOWED_HOSTS` | Extra host names the page answers to, comma-separated (e.g. `notes.example.org`). IP addresses, `localhost`, `*.local`, single-label names and `*.ts.net` always work; any other name gets *421 Unknown host name*, which blocks DNS-rebinding pages. | |
 | `OPENPLAUD_LOOK` | Default look: `inbox`, `timeline`, `actions`, `command`, `board`, `reader`, `library`, `calendar`, `phone` or `console`. Each browser can pick its own from the page. | `inbox` |
 | `OPENPLAUD_LIST_DAYS` | How many days of recordings the page lists | `30` |
@@ -70,6 +72,20 @@ OpenPlaud has no delete. Running a recording again, or moving a note into a fold
 name, writes `name-2.md` beside the original. Folders organize notes in `/data/notes`.
 
 Notes, the Plaud sign-in and the record of processed recordings live in `/data`.
+
+## Checking for new recordings right away
+
+Besides the schedule (60 minutes by default), a check starts when:
+
+- you press **Check Plaud now** on the page;
+- you open the page and the last check is more than 5 minutes old (`OPENPLAUD_CHECK_ON_OPEN`, minutes; `0` turns it off);
+- a recent recording is still waiting on Plaud for its transcript: the app checks again every 3 minutes for up to an hour, so it shows up soon after Plaud finishes;
+- something calls the **check trigger**: `POST /api/check` with the header `Authorization: Bearer <OPENPLAUD_CHECK_TOKEN>`. It needs no page password, only that token (16 characters or more; BoxPilot generates one, shown under the app's Secrets).
+
+An iPhone Shortcut that checks after a meeting: add **Get Contents of URL**, set the URL to
+`https://<your-box>.ts.net:8795/api/check`, Method **POST**, and a header `Authorization` = `Bearer <your check token>`.
+Run it from the Home Screen, the Action button or an automation (for example, when the Plaud app closes).
+From a computer: `curl -X POST -H "Authorization: Bearer $TOKEN" https://<your-box>.ts.net:8795/api/check`.
 
 ## Command line
 
