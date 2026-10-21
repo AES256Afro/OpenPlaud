@@ -47,7 +47,7 @@ class Paths(unittest.TestCase):
         note = self.root / "n.md"
         note.write_text("moving")
         pa.save_state({"processed": {"r1": {"file": str(note)}}})
-        moved = nt.move_note(self.root, note, self.root / "Work")
+        moved, _ = nt.move_note(self.root, note, self.root / "Work")
         self.assertEqual(moved.name, "n-2.md")
         self.assertEqual((self.root / "Work" / "n.md").read_text(), "already here")
         self.assertEqual(moved.read_text(), "moving")

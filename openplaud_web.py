@@ -204,6 +204,21 @@ jobs = Jobs()
 
 # ---------------------------------------------------------------- what a page shows
 
+def transcript_for(file_id: str | None, may_ask_plaud: bool) -> list[str] | None:
+    """A recording's transcript with the owner's speaker names: the stored copy, else Plaud (and keep a copy)."""
+    if not file_id:
+        return None
+    text = pa.load_transcript(file_id)
+    if text is None and may_ask_plaud:
+        lines = plaud.transcript(file_id)
+        if lines:
+            text = "\n".join(lines)
+            pa.save_transcript(file_id, text)
+    if text is None:
+        return None
+    return pa.apply_speakers(text, pa.load_state().get("speakers", {}).get(file_id)).splitlines()
+
+
 def model_label(cfg: dict) -> str:
     provider = cfg["backend"]
     model = {"claude": cfg["claude"]["model"], "chatgpt": cfg["chatgpt"]["model"], "local": cfg["local"]["model"]}.get(provider, "?")
@@ -215,6 +230,19 @@ def read_note(root: Path, path: Path) -> dict:
     folder = nt.rel_of(root, path.parent) if path.parent != root else ""
     return {"rel": nt.rel_of(root, path), "url": nt.note_url(root, path), "folder": folder, "back": nt.folder_url(folder),
             "title": nt.note_title(text, path.stem), "html": ui.render_markdown(text), "text": text, "stem": path.stem}
+
+
+FILTERS = {key: test for key, test in ui.FILTER_TESTS.items() if key}
+
+
+def mark_read(note_text: str) -> None:
+    rid = nt.plaud_id(note_text)
+    if not rid:
+        return
+    state = pa.load_state()
+    if rid not in state.setdefault("read", {}):
+        state["read"][rid] = datetime.now().isoformat(timespec="seconds")
+        pa.save_state(state)
 
 
 def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
@@ -235,7 +263,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
             continue
         notes.append({"path": path, "rel": nt.rel_of(root, path), "url": nt.note_url(root, path), "stem": path.stem,
                       "folder": nt.rel_of(root, path.parent) if path.parent != root else "", "title": nt.note_title(text, path.stem),
-                      "summary": nt.note_summary(text), "actions": nt.note_actions(text), "plaud_id": nt.plaud_id(text),
+                      "summary": nt.note_summary(text), "actions": nt.note_actions(text, with_lines=True), "plaud_id": nt.plaud_id(text),
                       "day": datetime.fromtimestamp(path.stat().st_mtime).date()})
     by_path = {n["path"].resolve(): n for n in notes}
 
@@ -259,6 +287,8 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
                     status = "queued"
                 elif note:
                     status = "filed" if note["folder"] else "ready"
+                elif rid in state.get("failed", {}):
+                    status = "failed"
                 elif rid in state.get("no_transcript", {}):
                     status = "no_transcript"
                 else:
@@ -270,7 +300,9 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
                     "note_url": note["url"] if note else None, "note_rel": note["rel"] if note else None,
                     "note_folder": note["folder"] if note else "", "summary": note["summary"] if note else "",
                     "actions_open": sum(1 for a in note["actions"] if not a["done"]) if note else 0,
-                    "claude_url": sent.get(rid, {}).get("session_url"), "claude_error": failed.get(rid, {}).get("error")})
+                    "claude_url": sent.get(rid, {}).get("session_url"), "claude_error": failed.get(rid, {}).get("error"),
+                    "unread": bool(note) and rid not in state.get("read", {}),
+                    "error": state.get("failed", {}).get(rid, {}).get("error")})
         except TimeoutError:
             recordings_error = "Plaud is busy with a sync. The list refreshes when it's done."
         except pa.PlaudError as err:
@@ -290,18 +322,31 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
     for i, part in enumerate(parts):
         crumbs.append((part, nt.folder_url("/".join(parts[: i + 1]))))
 
-    actions = [{"text": a["text"], "done": a["done"], "note_url": n["url"], "note_title": n["title"], "day": n["day"]}
-               for n in notes for a in n["actions"]]
+    actions = [{"text": a["text"], "done": a["done"], "line": a["line"], "note_rel": n["rel"], "note_url": n["url"],
+                "note_title": n["title"], "day": n["day"]} for n in notes for a in n["actions"]]
+
+    show = query.get("show", "")
+    all_recordings = recordings
+    if recordings is not None and show in FILTERS:
+        recordings = [r for r in recordings if FILTERS[show](r)]
+    search = None
+    if query.get("q", "").strip():
+        titles = {r["id"]: r["name"] for r in all_recordings or []}
+        search = nt.search(root, query["q"], titles)
+        for hit in search:
+            if hit["kind"] == "transcript":
+                path = nt.note_for(root, state["processed"].get(hit["id"]))
+                hit["url"] = nt.note_url(root, path) if path else None
 
     selected = None
     if query.get("note"):
         path = nt.inside(root, query["note"])
         if path and path.suffix == ".md" and path.is_file():
             selected = read_note(root, path)
+            mark_read(selected["text"])
     transcript = None
     if look == "reader" and selected:
-        pid = nt.plaud_id(selected["text"])
-        transcript = plaud.transcript(pid) if pid and plaud_state["state"] == "signed_in" else None
+        transcript = transcript_for(nt.plaud_id(selected["text"]), plaud_state["state"] == "signed_in")
 
     try:
         week = max(-52, min(52, int(query.get("week", "0"))))
@@ -320,7 +365,14 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         "notes_here": [n for n in notes if n["folder"] == folder], "recent_notes": notes,
         "actions": actions, "counts": {"notes": len(notes)},
         "tasks": TASK_LABELS, "default_task": DEFAULT_TASK, "note": selected, "transcript": transcript,
+        "show": show if show in FILTERS else "", "q": query.get("q", ""), "search": search, "undo": query.get("undo", ""),
+        "all_recordings": all_recordings, "moves": nt.move_history(root, 10),
     }
+
+
+def with_undo(url: str, move_id: str) -> str:
+    base, hash_, fragment = url.partition("#")
+    return base + ("&" if "?" in base else "?") + urllib.parse.urlencode({"undo": move_id}) + hash_ + fragment
 
 
 def claude_context(look: str, flash: str | None) -> dict:
@@ -378,8 +430,12 @@ class Handler(BaseHTTPRequestHandler):
         return passwords.valid(core.cookie(self.headers, COOKIE) or "")
 
     def _form(self) -> dict:
-        length = min(int(self.headers.get("Content-Length") or 0), 16384)
-        return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode()).items()}
+        """The posted form; a field sent more than once (selected notes) keeps every value under "<name>[]"."""
+        length = min(int(self.headers.get("Content-Length") or 0), 65536)
+        fields = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        form = {k: v[0] for k, v in fields.items()}
+        form.update({f"{k}[]": v for k, v in fields.items()})
+        return form
 
     def _bare_ctx(self) -> dict:
         return {"look": self._look(), "flash": None, "here": "/", "folder": "", "folders": []}
@@ -392,7 +448,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(200 if path == "/login" else 401, ui.login_page(self._bare_ctx()))
         query = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
-        here = url.path + ("?" + urllib.parse.urlencode({k: v for k, v in query.items() if k != "msg"}) if any(k != "msg" for k in query) else "")
+        kept = {k: v for k, v in query.items() if k not in ("msg", "undo")}
+        here = url.path + ("?" + urllib.parse.urlencode(kept) if kept else "")
         if path == "/":
             return self._send(200, ui.dashboard(build_context(self._look(), query, query.get("msg"), here)))
         if path == "/claude":
@@ -415,11 +472,10 @@ class Handler(BaseHTTPRequestHandler):
                               {"Content-Disposition": f'attachment; filename="{target.name}"'})
         look = self._look()
         note = read_note(root, target)
+        mark_read(note["text"])
         ctx = {"look": look, "flash": flash, "here": here, "folder": note["folder"], "folders": nt.all_folders(root)}
         with_transcript = look == "reader"
-        transcript = None
-        if with_transcript and nt.plaud_id(note["text"]):
-            transcript = plaud.transcript(nt.plaud_id(note["text"]))
+        transcript = transcript_for(nt.plaud_id(note["text"]), True) if with_transcript else None
         self._send(200, ui.note_page(ctx, note, transcript, with_transcript))
 
     def do_POST(self):
@@ -466,13 +522,55 @@ class Handler(BaseHTTPRequestHandler):
             note, dest = nt.inside(root, form.get("note", "")), nt.inside(root, form.get("dest", ""))
             if not note or note.suffix != ".md" or not note.is_file() or not dest or not dest.is_dir():
                 return self._redirect(back, "That note or folder doesn't exist.")
-            moved = nt.move_note(root, note, dest)
+            moved, move_id = nt.move_note(root, note, dest)
             where = nt.rel_of(root, dest) if dest != root else "the top level"
             if back.startswith("/notes/"):
                 back = nt.note_url(root, moved)
             elif "note=" in back:
                 back = "/?" + urllib.parse.urlencode({"note": nt.rel_of(root, moved)})
-            return self._redirect(back, f"Moved to {where} as {moved.name}.")
+            return self._redirect(with_undo(back, move_id), f"Moved to {where} as {moved.name}.")
+        if path == "/notes/move-many":
+            root = pa.notes_dir(pa.load_config())
+            dest = nt.inside(root, form.get("dest", ""))
+            picked = [nt.inside(root, rel) for rel in form.get("notes[]", [])[:200]]
+            picked = [n for n in picked if n and n.suffix == ".md" and n.is_file()]
+            if not dest or not dest.is_dir() or not picked:
+                return self._redirect(back, "Pick at least one note and a folder.")
+            for note in picked:
+                nt.move_note(root, note, dest)
+            where = nt.rel_of(root, dest) if dest != root else "the top level"
+            return self._redirect(back, f"Moved {len(picked)} notes to {where}. Recent moves can be undone below.")
+        if path == "/notes/undo":
+            root = pa.notes_dir(pa.load_config())
+            restored = nt.undo_move(root, form.get("id", ""))
+            if not restored:
+                return self._redirect(back, "That move can't be undone: what it moved isn't where it was put any more.")
+            return self._redirect(back, f"Put back as {nt.rel_of(root, restored)}.")
+        if path in ("/folders/rename", "/folders/move"):
+            root = pa.notes_dir(pa.load_config())
+            folder = nt.inside(root, form.get("folder", ""))
+            if not folder or folder == root or not folder.is_dir():
+                return self._redirect(back, "That folder doesn't exist.")
+            try:
+                if path == "/folders/rename":
+                    moved, move_id = nt.rename_folder(root, folder, form.get("name", "").strip())
+                else:
+                    dest = nt.inside(root, form.get("dest", ""))
+                    if not dest or not dest.is_dir():
+                        return self._redirect(back, "That folder doesn't exist.")
+                    moved, move_id = nt.move_folder(root, folder, dest)
+            except ValueError as err:
+                return self._redirect(back, str(err))
+            return self._redirect(with_undo(nt.folder_url(nt.rel_of(root, moved)), move_id), f"Folder is now {nt.rel_of(root, moved)}.")
+        if path == "/actions/toggle":
+            root = pa.notes_dir(pa.load_config())
+            note = nt.inside(root, form.get("note", ""))
+            try:
+                line = int(form.get("line", "-1"))
+            except ValueError:
+                line = -1
+            ok = bool(note and note.suffix == ".md" and note.is_file()) and nt.set_action(note, line, form.get("text", ""), form.get("done") == "1")
+            return self._redirect(back, None if ok else "That note changed since the page loaded; reload and try again.")
         if path == "/sync":
             added = jobs.add(("sync",))
             return self._redirect(back, "Sync queued." if added else "A sync is already queued.")

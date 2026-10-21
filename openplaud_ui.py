@@ -74,7 +74,15 @@ THEMES = {
 STATUS = {
     "ready": ("Notes ready", "ok"), "filed": ("Filed", "info"), "writing": ("Writing notes…", "warn"),
     "queued": ("Queued", "warn"), "no_transcript": ("No transcript yet", "none"), "new": ("New", "info"),
+    "failed": ("Failed · retried next sync", "warn"),
 }
+FILTER_TESTS = {
+    "": lambda r: True, "unread": lambda r: r.get("unread"), "actions": lambda r: r.get("actions_open", 0) > 0,
+    "new": lambda r: r["status"] in ("new", "queued", "writing"), "waiting": lambda r: r["status"] == "no_transcript",
+    "failed": lambda r: r["status"] == "failed" or bool(r.get("claude_error")), "filed": lambda r: r["status"] == "filed",
+}
+FILTER_LABELS = [("", "All"), ("unread", "Unread"), ("actions", "Has action items"), ("new", "No notes yet"),
+                 ("waiting", "Waiting on Plaud"), ("failed", "Failed"), ("filed", "Filed")]
 
 BASE_CSS = """
 *{box-sizing:border-box}
@@ -110,7 +118,11 @@ details>summary{cursor:pointer;color:var(--muted)}
 ul.plain{list-style:none;margin:0;padding:0}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
 .stack{display:flex;flex-direction:column;gap:12px}
-@media (max-width:700px){ .hide-sm{display:none} }
+.topbar{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+.chips{gap:6px} .chip{font-size:13px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);text-decoration:none;color:var(--ink);white-space:nowrap}
+.chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.searchwrap{max-width:1200px;margin:0 auto;padding:0 20px}
+@media (max-width:700px){ .hide-sm{display:none} .topbar{padding:10px 14px} }
 """
 
 
@@ -146,7 +158,35 @@ def switcher(ctx: dict) -> str:
 
 
 def flash(ctx: dict) -> str:
-    return f'<div class="flash" role="status">{e(ctx["flash"])}</div>' if ctx.get("flash") else ""
+    if not ctx.get("flash"):
+        return ""
+    undo = (f'<form class="inline" method="post" action="/notes/undo"><input type="hidden" name="id" value="{e(ctx["undo"])}">'
+            f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><button class="btn small">Undo</button></form>') if ctx.get("undo") else ""
+    return f'<div class="flash spread" role="status"><span>{e(ctx["flash"])}</span>{undo}</div>'
+
+
+def topbar(ctx: dict) -> str:
+    """Search and filters, the same in every look, with results when there is a query."""
+    chips = []
+    for key, label in FILTER_LABELS:
+        count = "" if key == "" or not ctx.get("all_recordings") else f' <span class="muted">{sum(1 for r in ctx["all_recordings"] if FILTER_TESTS[key](r))}</span>'
+        href = "/" if not key else "/?" + urllib.parse.urlencode({"show": key})
+        current = ' aria-current="page"' if ctx.get("show", "") == key else ""
+        chips.append(f'<a class="chip{" on" if current else ""}" href="{e(href)}"{current}>{e(label)}{count}</a>')
+    results = ""
+    if ctx.get("search") is not None:
+        hits = []
+        for h in ctx["search"]:
+            where = f'{e(h["where"])}' if h["kind"] == "note" else f'transcript{(" at " + e(h["stamp"])) if h.get("stamp") else ""}'
+            title = f'<a href="{e(h["url"])}">{e(h["title"])}</a>' if h.get("url") else e(h["title"])
+            hits.append(f'<li style="padding:8px 0;border-top:1px solid var(--line)">{title} <span class="muted" style="font-size:12px">· {where}</span>'
+                        f'<div class="muted" style="font-size:13px">{e(h["snippet"])}</div></li>')
+        body = "".join(hits) or '<li class="muted" style="padding:8px 0">Nothing matches every word.</li>'
+        results = (f'<section class="panel" style="margin-top:10px"><div class="spread"><strong>{len(ctx["search"])} results for “{e(ctx["q"])}”</strong>'
+                   f'<a href="/">Clear</a></div><ul class="plain">{body}</ul></section>')
+    return f"""<div class="topbar"><form class="inline" method="get" action="/" role="search"><label><span class="sr-only">Search notes and transcripts</span>
+<input type="search" name="q" id="search" value="{e(ctx.get('q', ''))}" placeholder="Search notes and transcripts  ( / )" style="width:min(360px,70vw)"></label>
+<button class="btn small">Search</button></form><nav class="row chips" aria-label="Filter recordings">{''.join(chips)}</nav></div>{results}"""
 
 
 def sync_button(label: str = "Sync now", cls: str = "btn primary") -> str:
@@ -165,7 +205,9 @@ def sync_text(ctx: dict) -> str:
 
 def badge(rec: dict) -> str:
     label, kind = STATUS.get(rec["status"], (rec["status"], "none"))
-    return f'<span class="badge {kind}">{e(label)}</span>'
+    unread = '<span class="badge info">Unread</span> ' if rec.get("unread") else ""
+    title = f' title="{e(rec["error"])}"' if rec.get("error") and rec["status"] == "failed" else ""
+    return f'{unread}<span class="badge {kind}"{title}>{e(label)}</span>'
 
 
 def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
@@ -266,9 +308,16 @@ def open_link(ctx: dict, rec: dict) -> str:
 def notes_list(ctx: dict, with_move: bool = True) -> str:
     rows = []
     for n in ctx["notes_here"]:
-        rows.append(f'<tr><td><a href="{e(n["url"])}">{e(n["title"])}</a><div class="muted" style="font-size:12px">{e(n["stem"])}</div></td>'
+        pick = f'<td style="width:28px"><input type="checkbox" form="bulkmove" name="notes" value="{e(n["rel"])}" aria-label="Select {e(n["title"])}"></td>'
+        rows.append(f'<tr>{pick}<td><a href="{e(n["url"])}">{e(n["title"])}</a><div class="muted" style="font-size:12px">{e(n["stem"])}</div></td>'
                     f'<td>{move_form(ctx, n["rel"], ctx["folder"]) if with_move else ""}</td></tr>')
-    return f'<div class="scroll"><table>{"".join(rows)}</table></div>' if rows else '<p class="muted">No notes in this folder.</p>'
+    if not rows:
+        return '<p class="muted">No notes in this folder.</p>'
+    dests = "".join(f'<option value="{e(f)}">{e(f or "Top level")}</option>' for f in [""] + ctx["folders"] if f != ctx["folder"])
+    bulk = (f'<form id="bulkmove" class="row" method="post" action="/notes/move-many" style="margin:0 0 8px">'
+            f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><span class="muted" style="font-size:13px">Selected notes:</span>'
+            f'<select name="dest" aria-label="Move selected notes to">{dests}</select><button class="btn small">Move selected</button></form>') if dests else ""
+    return f'{bulk}<div class="scroll"><table>{"".join(rows)}</table></div>'
 
 
 def folders_here(ctx: dict) -> str:
@@ -276,11 +325,41 @@ def folders_here(ctx: dict) -> str:
     return f'<ul class="plain row" style="gap:8px 20px;margin-bottom:12px">{items}</ul>' if items else ""
 
 
+def folder_tools(ctx: dict) -> str:
+    """Rename or move the folder being looked at (never delete)."""
+    if not ctx.get("folder"):
+        return ""
+    name = ctx["folder"].rsplit("/", 1)[-1]
+    dests = "".join(f'<option value="{e(f)}">{e(f or "Top level")}</option>' for f in [""] + ctx["folders"]
+                    if f != ctx["folder"] and not f.startswith(ctx["folder"] + "/") and f != (ctx["folder"].rsplit("/", 1)[0] if "/" in ctx["folder"] else ""))
+    move = (f'<form class="inline" method="post" action="/folders/move"><input type="hidden" name="folder" value="{e(ctx["folder"])}">'
+            f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><select name="dest" aria-label="Move this folder into">{dests}</select>'
+            f'<button class="btn small">Move folder</button></form>') if dests else ""
+    return (f'<details style="margin:0 0 12px"><summary>Folder options</summary><div class="row" style="margin-top:8px">'
+            f'<form class="inline" method="post" action="/folders/rename"><input type="hidden" name="folder" value="{e(ctx["folder"])}">'
+            f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><input type="text" name="name" value="{e(name)}" required maxlength="60" aria-label="New folder name" style="width:160px">'
+            f'<button class="btn small">Rename</button></form>{move}</div></details>')
+
+
+def recent_moves(ctx: dict) -> str:
+    moves = ctx.get("moves") or []
+    if not moves:
+        return ""
+    def place(rel: str) -> str:
+        return rel.rsplit("/", 1)[0] if "/" in rel else "Top level"
+
+    rows = "".join(f'<li class="spread" style="padding:4px 0"><span class="muted" style="font-size:13px">{e(m["at"][5:16].replace("T", " "))} · '
+                   f'{"Put back: " if m["kind"] == "undo" else ""}{e(m["to"].rsplit("/", 1)[-1])}: {e(place(m["from"]))} → {e(place(m["to"]))}</span>'
+                   + ("" if m["kind"] == "undo" else f'<form class="inline" method="post" action="/notes/undo"><input type="hidden" name="id" value="{e(m["id"])}">'
+                      f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><button class="btn small">Undo</button></form>') + '</li>' for m in moves)
+    return f'<details style="margin-top:10px"><summary>Recent moves</summary><ul class="plain" style="margin-top:6px">{rows}</ul></details>'
+
+
 def notes_panel(ctx: dict, title: str = "") -> str:
     return f"""<section class="panel" id="notes"><div class="spread" style="margin-bottom:10px">
 <h2 style="margin:0;font-size:16px">{title or breadcrumbs(ctx)}</h2>{new_folder_form(ctx)}</div>
-{folders_here(ctx)}{notes_list(ctx)}
-<p class="muted" style="font-size:13px;margin-bottom:0">New notes arrive in the top level. Moving a note never replaces another; nothing here is ever deleted.</p></section>"""
+{folder_tools(ctx)}{folders_here(ctx)}{notes_list(ctx)}{recent_moves(ctx)}
+<p class="muted" style="font-size:13px;margin-bottom:0">New notes arrive in the top level. Moving never replaces a note, every move can be undone, and nothing here is ever deleted.</p></section>"""
 
 
 def folder_nav(ctx: dict) -> str:
@@ -300,11 +379,15 @@ def actions_list(ctx: dict, limit: int | None = None, show_done: bool = False) -
         return '<p class="muted">No open action items.</p>'
     done_style = ' style="text-decoration:line-through;color:var(--muted)"'
     return "".join(
-        f'<label class="actrow" style="display:flex;gap:10px;align-items:flex-start;padding:8px 0">'
-        f'<input type="checkbox" disabled{" checked" if a["done"] else ""} style="margin-top:4px">'
-        f'<span><span{done_style if a["done"] else ""}>{e(a["text"])}</span><br>'
-        f'<span class="muted" style="font-size:13px">from <a href="{e(a["note_url"])}">{e(a["note_title"])}</a></span></span></label>'
-        for a in items)
+        f'<form class="actrow" method="post" action="/actions/toggle" style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;margin:0">'
+        f'<input type="hidden" name="note" value="{e(a["note_rel"])}"><input type="hidden" name="line" value="{a["line"]}">'
+        f'<input type="hidden" name="text" value="{e(a["text"])}"><input type="hidden" name="done" value="{"0" if a["done"] else "1"}">'
+        f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}">'
+        f'<input type="checkbox" id="act-{i}"{" checked" if a["done"] else ""} onchange="this.form.submit()" style="margin-top:4px;width:18px;height:18px">'
+        f'<label for="act-{i}"><span{done_style if a["done"] else ""}>{e(a["text"])}</span><br>'
+        f'<span class="muted" style="font-size:13px">from <a href="{e(a["note_url"])}">{e(a["note_title"])}</a></span></label>'
+        f'<noscript><button class="btn small">{"Reopen" if a["done"] else "Done"}</button></noscript></form>'
+        for i, a in enumerate(items))
 
 
 def render_markdown(md: str) -> str:
@@ -640,7 +723,10 @@ RENDERERS = {"inbox": look_inbox, "timeline": look_timeline, "actions": look_act
 
 def dashboard(ctx: dict) -> str:
     body, css = RENDERERS[ctx["look"]](ctx)
-    return page(ctx, "OpenPlaud", body, css, poll=ctx["busy"] or ctx["plaud"]["state"] == "waiting")
+    bar = topbar(ctx)
+    if ctx.get("search") is not None:
+        bar = bar.replace('</div><section class="panel"', '</div><div class="searchwrap"><section class="panel"', 1) + "</div>"
+    return page(ctx, "OpenPlaud", bar + body, css, poll=ctx["busy"] or ctx["plaud"]["state"] == "waiting")
 
 
 def note_page(ctx: dict, note: dict, transcript: list[str] | None = None, with_transcript: bool = False) -> str:

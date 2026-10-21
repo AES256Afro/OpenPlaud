@@ -143,6 +143,45 @@ class EndToEnd(unittest.TestCase):
         page = self.get("/notes/Work/" + urllib.parse.quote(sync_note.name), look="reader").read().decode()
         self.assertIn("Notes for Weekly security sync.", page)
         self.assertEqual(self.get("/claude").status, 200)
+
+        # Search finds notes and stored transcripts; filters narrow the list.
+        html = self.get("/?q=" + urllib.parse.quote("patch window")).read().decode()
+        self.assertIn("results for", html)
+        self.assertIn("transcript at", html)
+        self.assertIn("Notes for Weekly security sync.", self.get("/?q=weekly").read().decode())
+        waiting = self.get("/?show=waiting", look="console").read().decode()
+        self.assertIn("Voice memo", waiting)
+        self.assertNotIn('value="rec_long"', waiting)
+        self.assertIn("Unread", self.get("/", look="console").read().decode())
+
+        # Ticking an action item changes only that box, and only if the line still matches.
+        sam = next(p for p in notes.glob("*.md") if "Sam" in p.name)
+        sam_before = hashlib.sha256(sam.read_bytes()).hexdigest()
+        lines = sam.read_text().split("\n")
+        line = next(i for i, l in enumerate(lines) if "Sam: share the list" in l)
+        self.post("/actions/toggle", note=sam.name, line=str(line), text="Sam: share the list", done="1", back="/")
+        self.assertIn("- [x] Sam: share the list", sam.read_text())
+        self.assertEqual(len(sam.read_text().split("\n")), len(lines))
+        self.post("/actions/toggle", note=sam.name, line=str(line), text="Something else", done="0", back="/")
+        self.assertIn("- [x] Sam: share the list", sam.read_text())
+
+        # Move several notes, rename and move a folder, undo: nothing is lost on the way.
+        self.post("/folders", parent="", name="Archive")
+        tops = [p.name for p in notes.glob("*.md")]
+        req = urllib.request.Request(self.base + "/notes/move-many",
+                                     urllib.parse.urlencode([("notes", n) for n in tops] + [("dest", "Archive"), ("back", "/")]).encode(),
+                                     {"Sec-Fetch-Site": "same-origin"})
+        self.opener.open(req, timeout=30)
+        self.assertEqual(sorted(p.name for p in (notes / "Archive").glob("*.md")), sorted(tops))
+        self.post("/folders/rename", folder="Archive", name="Old notes", back="/")
+        self.assertTrue((notes / "Old notes").is_dir())
+        self.post("/folders/move", folder="Old notes", dest="Work", back="/")
+        self.assertEqual(len(list((notes / "Work" / "Old notes").glob("*.md"))), len(tops))
+        moves = [json.loads(l) for l in (self.data / "moves.log").read_text().splitlines()]
+        self.post("/notes/undo", id=moves[-1]["id"], back="/")
+        self.assertTrue((notes / "Old notes").is_dir())
+        self.assertTrue(set(made.values()) - {sam_before} <= set(contents(notes).values()), "a note's content disappeared")
+        self.assertEqual(len(contents(notes)), 4)
         self.assertNotIn("Traceback", self.server_log())
 
 

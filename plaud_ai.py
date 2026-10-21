@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("PLAUD_AI_CONFIG", HERE / "plaud_ai.toml"))
 DATA_DIR = Path(os.environ.get("OPENPLAUD_DATA", HERE))
 STATE_PATH = DATA_DIR / ".plaud_ai_state.json"
+TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 PROVIDERS = ("claude", "chatgpt", "local")
 
 DEFAULT_CONFIG = {
@@ -122,11 +123,53 @@ def notes_dir(cfg: dict) -> Path:
 
 
 def load_state() -> dict:
-    return json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {"processed": {}}
+    if not STATE_PATH.exists():
+        return {"processed": {}}
+    try:
+        state = json.loads(STATE_PATH.read_text())
+    except ValueError:
+        # Keep the damaged file for inspection (nothing is deleted) and start a fresh record.
+        STATE_PATH.rename(STATE_PATH.with_name(f"{STATE_PATH.name}.damaged-{datetime.now():%Y%m%d-%H%M%S}"))
+        return {"processed": {}}
+    state.setdefault("processed", {})
+    return state
 
 
 def save_state(state: dict) -> None:
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    """Write the whole record to a temporary file first, so a crash mid-write never leaves half a file."""
+    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_PATH)
+
+
+def save_transcript(file_id: str, text: str) -> None:
+    """Keep a copy of a recording's transcript for search and the reader (it is Plaud's text, refreshed each run)."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", file_id):
+        return
+    TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = TRANSCRIPTS_DIR / f"{file_id}.txt.tmp"
+    tmp.write_text(text)
+    tmp.replace(TRANSCRIPTS_DIR / f"{file_id}.txt")
+
+
+def load_transcript(file_id: str) -> str | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", file_id or ""):
+        return None
+    path = TRANSCRIPTS_DIR / f"{file_id}.txt"
+    return path.read_text() if path.exists() else None
+
+
+def apply_speakers(text: str, names: dict | None) -> str:
+    """Use the owner's names for Plaud's speaker labels ("Speaker 1" -> "Sam") at the start of each line."""
+    if not names:
+        return text
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^(\[[^\]]*\] )([^:]+)(: .*)$", line)
+        if m and m.group(2) in names and names[m.group(2)].strip():
+            line = f"{m.group(1)}{names[m.group(2)].strip()}{m.group(3)}"
+        out.append(line)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------- Plaud (MCP over stdio)
@@ -548,6 +591,8 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     transcript = fetch_transcript(plaud, fid)
     if not transcript.strip():
         raise NoTranscript("no transcript yet (transcribe it in the Plaud app); will retry next sync")
+    save_transcript(fid, transcript)
+    transcript = apply_speakers(transcript, load_state().get("speakers", {}).get(fid))
     log(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}")
     body = run_task(backend, transcript, instructions, title, log)
     out_dir.mkdir(parents=True, exist_ok=True)
