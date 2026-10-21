@@ -252,7 +252,9 @@ def claude_bits(ctx: dict, rec: dict) -> str:
     if not ctx.get("claude_on"):
         return ""
     err = f'<span class="muted" style="font-size:12px" title="{e(rec["claude_error"])}">Claude: not sent ⓘ</span>' if rec.get("claude_error") else ""
-    return (f'{err}<form class="inline" method="post" action="/claude/send"><input type="hidden" name="id" value="{e(rec["id"])}">'
+    confirm = (' onsubmit="return confirm(\'The last send may have reached Claude. Check claude.ai/code first. Send anyway?\')"'
+               if rec.get("claude_unsure") else "")
+    return (f'{err}<form class="inline" method="post" action="/claude/send"{confirm}><input type="hidden" name="id" value="{e(rec["id"])}">'
             f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><button class="btn small">Send to Claude</button></form>')
 
 

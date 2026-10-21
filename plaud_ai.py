@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import http.client
 import json
 import os
 import re
@@ -446,21 +447,27 @@ def http_json(url: str, body: dict | None, headers: dict, timeout: float, attemp
     Honors Retry-After up to a minute. Other errors are raised at once."""
     last: Exception | None = None
     for attempt in range(attempts):
-        req = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
         try:
+            req = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read())
+                raw = r.read()
+        except (http.client.InvalidURL, ValueError):
+            # These messages quote the address, which may hold a password: name it without one.
+            raise RuntimeError(f"The address {redact_url(url)} isn't usable. Put no user name, password or key in it.") from None
         except urllib.error.HTTPError as e:
             if e.code not in RETRY_STATUS or attempt == attempts - 1:
                 raise
             wait = e.headers.get("Retry-After")
             last = e
             sleep(min(60, int(wait)) if wait and wait.isdigit() else (2, 8, 20)[min(attempt, 2)])
+            continue
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             if attempt == attempts - 1:
                 raise
             last = e
             sleep((2, 8, 20)[min(attempt, 2)])
+            continue
+        return json.loads(raw)
     raise last  # pragma: no cover
 
 
@@ -569,8 +576,7 @@ class LocalBackend:
 
     def check(self) -> str:
         url = f"{self.base}/api/tags" if self.cfg["kind"] == "ollama" else f"{self.base.removesuffix('/v1')}/v1/models"
-        with urllib.request.urlopen(url, timeout=5) as r:
-            data = json.loads(r.read())
+        data = http_json(url, None, {}, 5, attempts=1)
         names = [m.get("name") or m.get("id") for m in data.get("models", data.get("data", []))]
         status = "available" if self.cfg["model"] in names else f"NOT FOUND (server has: {', '.join(names)})"
         return f"{self.name}: model {status}"
@@ -888,8 +894,7 @@ def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir
                                       on_done=on_done)
         except NotSignedIn:
             raise
-        except Unpriced as e:
-            record_failure(rec_id(rec), e)
+        except Unpriced as e:  # not a failure of the recording: it waits until the cap or the model changes
             log(f"… {rec.get('name', rec_id(rec))}: {e}")
             continue
         except CapReached as e:

@@ -100,6 +100,8 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
             when = pa.recorded_at(rec)
             if rid in c["sent"] or rid in c["inflight"] or (since and when and when < since):
                 return
+            if c["failed"].get(rid, {}).get("retryable") is False:
+                return  # the last send may have reached Claude: only the owner sends it again
         budget = cr.FireBudget([float(s) for s in c["fires"]])
         wait = c.get("not_before") or 0
         if wait > time.time() or not budget.available():
@@ -428,6 +430,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
                     "note_folder": note["folder"] if note else "", "summary": note["summary"] if note else "",
                     "actions_open": sum(1 for a in note["actions"] if not a["done"]) if note else 0,
                     "claude_url": sent.get(rid, {}).get("session_url"), "claude_error": failed.get(rid, {}).get("error"),
+                    "claude_unsure": failed.get(rid, {}).get("retryable") is False,
                     "unread": bool(note) and rid not in state.get("read", {}),
                     "error": state.get("failed", {}).get(rid, {}).get("error")})
         except TimeoutError:

@@ -364,3 +364,11 @@ class SweepTwo(unittest.TestCase):
         start = time.time()
         self.assertTrue(pw.check("secret"))
         self.assertLess(time.time() - start, 0.5)
+
+
+class SweepThree(unittest.TestCase):
+    def test_passwords_in_model_addresses_never_reach_messages(self):
+        for url in ["https://user:s3cret@llm.example/api/chat", "user:s3cret@llm.example/api/chat"]:
+            with self.assertRaises(Exception) as ctx:
+                pa.http_json(url, {}, {}, 2, attempts=1)
+            self.assertNotIn("s3cret", str(ctx.exception))
