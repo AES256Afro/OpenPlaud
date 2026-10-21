@@ -174,12 +174,46 @@ class PlaudSignIn:
 
 
 class Passwords:
-    """The page's own password and its signed session cookie."""
+    """The page's own password and its signed session cookie.
 
-    def __init__(self, password: str, salt: bytes, days: int = 30):
+    With a `secret_file`, cookies are signed with a random secret kept in the data folder (made on first use),
+    so a copied cookie can't be used to guess the password offline, and `end_all()` (Lock) replaces the
+    secret, which signs out every browser at once. Changing the password also ends every session."""
+
+    def __init__(self, password: str, salt: bytes, days: int = 30, secret_file: Path | None = None):
         self.password = password
         self.days = days
-        self.key = hashlib.sha256(salt + password.encode()).digest()
+        self.salt = salt
+        self.secret_file = secret_file
+        self.key = self._key()
+
+    def _key(self) -> bytes:
+        base = self.salt + self.password.encode()
+        if not self.secret_file:
+            return hashlib.sha256(base).digest()
+        try:
+            secret = self.secret_file.read_bytes()
+        except FileNotFoundError:
+            secret = b""
+        if len(secret) < 32:
+            secret = self._new_secret()
+        return hmac.new(secret, base, "sha256").digest()
+
+    def _new_secret(self) -> bytes:
+        secret = os.urandom(32)
+        self.secret_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.secret_file.with_name(self.secret_file.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(secret)
+        os.replace(tmp, self.secret_file)
+        return secret
+
+    def end_all(self) -> None:
+        """Sign out every browser (only with a secret file; otherwise just this one, by its cookie)."""
+        if self.secret_file:
+            self._new_secret()
+            self.key = self._key()
 
     _guard = threading.Lock()
 

@@ -47,7 +47,7 @@ TASK_LABELS = {"summary": "Meeting notes", "actions": "Action items", "followup"
 
 plaud = core.PlaudSession(LIST_DAYS)
 signin = core.PlaudSignIn(plaud, AUTH_URL_FILE)
-passwords = core.Passwords(PASSWORD, b"openplaud-session:", SESSION_DAYS)
+passwords = core.Passwords(PASSWORD, b"openplaud-session:", SESSION_DAYS, pa.DATA_DIR / ".session-secret")
 
 
 def now() -> str:
@@ -646,6 +646,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send(401, ui.login_page(self._bare_ctx()))
         if path == "/logout":
+            passwords.end_all()
             return self._redirect("/", headers={"Set-Cookie": f"{COOKIE}=; Path=/; Max-Age=0"})
         if path == "/look":
             look = form.get("look", "")

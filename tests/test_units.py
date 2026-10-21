@@ -372,3 +372,15 @@ class SweepThree(unittest.TestCase):
             with self.assertRaises(Exception) as ctx:
                 pa.http_json(url, {}, {}, 2, attempts=1)
             self.assertNotIn("s3cret", str(ctx.exception))
+
+    def test_lock_ends_every_session_and_the_key_isnt_the_password(self):
+        secret = Path(tempfile.mkdtemp()) / ".session-secret"
+        pw = core.Passwords("secret", b"salt:", 30, secret)
+        token = pw.make()
+        self.assertTrue(pw.valid(token))
+        self.assertEqual(secret.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(core.Passwords("secret", b"salt:", 30, secret).valid(token))  # survives a restart
+        self.assertFalse(core.Passwords("secret", b"salt:").valid(token))  # not derivable from the password alone
+        pw.end_all()
+        self.assertFalse(pw.valid(token))
+        self.assertTrue(pw.valid(pw.make()))
