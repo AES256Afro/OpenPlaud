@@ -19,7 +19,9 @@ PLAUD_ID_LINE = re.compile(r"Plaud file ID:\s*`([A-Za-z0-9_-]+)`")
 
 def inside(root: Path, rel: str) -> Path | None:
     """The path `rel` names under `root`, or None when it is malformed or would leave it."""
-    rel = (rel or "").strip("/")
+    rel = (rel or "").rstrip("/")
+    if rel.startswith("/"):
+        return None
     if rel and not all(PATH_PART.fullmatch(part) for part in rel.split("/")):
         return None
     path = (root / rel).resolve()

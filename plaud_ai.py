@@ -164,6 +164,8 @@ class Plaud:
 
     @staticmethod
     def default_command(cfg: dict) -> list[str]:
+        if os.environ.get("OPENPLAUD_PLAUD_COMMAND"):
+            return json.loads(os.environ["OPENPLAUD_PLAUD_COMMAND"])
         if cfg["plaud"]["command"]:
             return cfg["plaud"]["command"]
         local = HERE / "node_modules/@plaud-ai/mcp/dist/index.js"
