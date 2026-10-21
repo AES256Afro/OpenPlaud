@@ -108,7 +108,7 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
             why = (f"Claude asked to wait until {datetime.fromtimestamp(wait):%H:%M}" if wait > time.time()
                    else "Claude's hourly limit for this task is nearly used")
             c["failed"][rid] = {"error": f"Waiting: {why}. Sent on a later check.", "retryable": True, "at": datetime.now().isoformat(), "name": name}
-            log(f"… Claude: {why.lower()}, {name} waits for the next sync")
+            log(f"… Claude: {why.lower()}, {name} waits for the next check")
             return
         budget.spend()
         c["fires"] = budget.stamps
