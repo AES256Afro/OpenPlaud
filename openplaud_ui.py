@@ -197,6 +197,11 @@ def topbar(ctx: dict) -> str:
 <button class="btn small">Search</button></form><nav class="row chips" aria-label="Filter recordings">{''.join(chips)}</nav></div>{results}"""
 
 
+def digest_button() -> str:
+    return ('<form class="inline" method="post" action="/digest"><button class="btn" title="A note listing the last 7 days of notes and '
+            'every open action item. Free: no model is used.">Weekly digest</button></form>')
+
+
 def sync_button(label: str = "Check Plaud now", cls: str = "btn primary") -> str:
     return f'<form class="inline" method="post" action="/sync"><button class="{cls}">{e(label)}</button></form>'
 
@@ -455,7 +460,9 @@ def render_markdown(md: str) -> str:
 
     def inline(text: str) -> str:
         text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
-        return re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+        text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+        # Links only to this app's own notes (the weekly digest uses them); any other link stays plain text.
+        return re.sub(r"\[([^\]]+)\]\((/notes/[A-Za-z0-9/_.~%-]+)\)", r'<a href="\2">\1</a>', text)
 
     def flush():
         nonlocal para, in_list
@@ -606,7 +613,7 @@ def look_actions(ctx):
         return f'<div class="group">{e(title)}</div>' + (actions_list(dict(ctx, actions=items)) if items else '<p class="muted">None.</p>')
 
     body = f"""<div class="ac"><div class="spread"><div><div class="mono muted" style="font-size:12px;letter-spacing:.08em">OPENPLAUD / ACTIONS</div>
-<h1 style="margin:6px 0 0;font-size:30px">{len(open_items)} open · {len(this_week)} from this week</h1></div><div class="row">{switcher(ctx)}{sync_button()}</div></div>
+<h1 style="margin:6px 0 0;font-size:30px">{len(open_items)} open · {len(this_week)} from this week</h1></div><div class="row">{digest_button()}{switcher(ctx)}{sync_button()}</div></div>
 <div class="tiles"><div class="tile"><span class="muted">Open</span><b style="color:var(--accent)">{len(open_items)}</b></div>
 <div class="tile"><span class="muted">Done</span><b style="color:var(--ok-ink)">{done}</b></div>
 <div class="tile"><span class="muted">Notes</span><b>{ctx['counts']['notes']}</b></div>
@@ -645,7 +652,8 @@ q.addEventListener('keydown',ev=>{if(ev.key==='Enter'){ev.preventDefault();const
 
 def palette(ctx: dict) -> str:
     """⌘K / Ctrl-K in every look: sync, open, run, send, go to a folder or filter, switch look."""
-    cmds = ['<li data-k="sync now refresh check"><form method="post" action="/sync"><button>Check Plaud now</button></form></li>']
+    cmds = ['<li data-k="sync now refresh check"><form method="post" action="/sync"><button>Check Plaud now</button></form></li>',
+            '<li data-k="weekly digest summary week"><form method="post" action="/digest"><button>Write this week\'s digest</button></form></li>']
     for key, label in FILTER_LABELS:
         href = "/" if not key else "/?" + urllib.parse.urlencode({"show": key})
         cmds.append(f'<li data-k="show filter {e(label.lower())}"><a href="{e(href)}">Show: {e(label)}</a></li>')

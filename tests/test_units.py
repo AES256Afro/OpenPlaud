@@ -394,3 +394,30 @@ class SweepThree(unittest.TestCase):
             self.assertFalse(pa.priced(pa.backend_for(pa.load_config(), "chatgpt:gpt-z")))
         finally:
             del os.environ["OPENPLAUD_PRICES"]
+
+
+class Digest(unittest.TestCase):
+    def test_digest_lists_the_week_and_open_items_and_links_safely(self):
+        from datetime import date
+        root = Path(tempfile.mkdtemp()).resolve()
+        (root / "Work").mkdir()
+        (root / "Work" / "a.md").write_text("# Sync\n\n- Date: 2026-10-20\n\n## Summary\nPatch window moves.\n\n- [ ] Sam: share list\n- [x] done one\n")
+        (root / "old.md").write_text("# Old\n\n- Date: 2026-09-01\n\n- [ ] stale\n")
+        text, count = nt.weekly_digest(root, date(2026, 10, 21))
+        self.assertEqual(count, 1)
+        self.assertIn("[Sync](/notes/Work/a.md): Patch window moves.", text)
+        self.assertIn("- [ ] Sam: share list _(from Sync)_", text)
+        self.assertNotIn("stale", text)
+        html = ui.render_markdown(text + "\n[x](javascript:alert(1)) [y](/notes/a\" onmouseover=\"x)")
+        self.assertIn('<a href="/notes/Work/a.md">Sync</a>', html)
+        self.assertNotIn("javascript:alert(1)\"", html)
+        self.assertNotIn('onmouseover="x', html)
+
+
+class SweepFive(unittest.TestCase):
+    def test_old_failures_keep_their_duplicate_send_guard(self):
+        import openplaud_web as web
+        c = web.claude_state({"claude": {"failed": {"r1": {"error": "timed out", "retryable": False},
+                                                    "r2": {"error": "429", "retryable": True}}}})
+        self.assertTrue(c["failed"]["r1"]["unknown"])
+        self.assertFalse(c["failed"]["r2"]["unknown"])

@@ -249,6 +249,15 @@ class EndToEnd(unittest.TestCase):
         except urllib.error.HTTPError as err:
             self.assertEqual(err.headers["Location"], "/")
 
+        # The weekly digest is a new note (never replacing one), built from the notes alone.
+        before = contents(notes)
+        page = self.post("/digest", back="/").read().decode()
+        self.assertIn("Weekly digest", page)
+        self.assertIn("Sam: share the list", page)
+        after = contents(notes)
+        self.assertTrue(all(after.get(k) == v for k, v in before.items()))
+        self.assertEqual(len(after), len(before) + 1)
+
         # The activity log is kept on disk.
         self.assertIn("Sync finished", (self.data / "activity.log").read_text())
         self.assertNotIn("Traceback", self.server_log())

@@ -65,6 +65,9 @@ def claude_state(state: dict) -> dict:
     for key in ("sent", "failed", "inflight"):
         c.setdefault(key, {})
     c.setdefault("fires", [])
+    for failure in c["failed"].values():
+        # Saved before "unknown" existed: treat any failure that wasn't retryable as possibly sent (the careful choice).
+        failure.setdefault("unknown", failure.get("retryable") is False)
     return c
 
 
@@ -737,6 +740,11 @@ class Handler(BaseHTTPRequestHandler):
                 line = -1
             ok = bool(note and note.suffix == ".md" and note.is_file()) and nt.set_action(note, line, form.get("text", ""), form.get("done") == "1")
             return self._redirect(back, None if ok else "That note changed since the page loaded; reload and try again.")
+        if path == "/digest":
+            root = pa.notes_dir(pa.load_config())
+            text, count = nt.weekly_digest(root, date.today())
+            note = pa.write_new(root / f"{date.today().isoformat()}-weekly-digest.md", text)
+            return self._redirect(nt.note_url(root, note), f"Weekly digest written from {count} note{'s' if count != 1 else ''}.")
         if path == "/sync":
             added = jobs.add(("sync",))
             return self._redirect(back, "Checking Plaud for new recordings. Progress shows under Activity." if added else "A check is already queued.")
