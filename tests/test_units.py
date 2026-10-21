@@ -392,6 +392,10 @@ class SweepThree(unittest.TestCase):
             self.assertIsNone(pa.model_cost("broken", 1, 1))
             self.assertTrue(pa.priced(pa.backend_for(pa.load_config(), "chatgpt:gpt-y")))
             self.assertFalse(pa.priced(pa.backend_for(pa.load_config(), "chatgpt:gpt-z")))
+            os.environ["OPENPLAUD_PRICES"] = "claude-new=5/25,bad=nan/1,neg=-1/1"
+            self.assertAlmostEqual(pa.model_cost("claude-new", 1_000_000, 0), 5.0)
+            self.assertIsNone(pa.model_cost("bad", 1, 1))
+            self.assertIsNone(pa.model_cost("neg", 1, 1))
         finally:
             del os.environ["OPENPLAUD_PRICES"]
 
@@ -406,7 +410,8 @@ class Digest(unittest.TestCase):
         text, count = nt.weekly_digest(root, date(2026, 10, 21))
         self.assertEqual(count, 1)
         self.assertIn("[Sync](/notes/Work/a.md): Patch window moves.", text)
-        self.assertIn("- [ ] Sam: share list _(from Sync)_", text)
+        self.assertIn("- Sam: share list _(from Sync)_", text)
+        self.assertEqual(nt.note_actions(text), [])  # the digest adds no action items of its own
         self.assertNotIn("stale", text)
         html = ui.render_markdown(text + "\n[x](javascript:alert(1)) [y](/notes/a\" onmouseover=\"x)")
         self.assertIn('<a href="/notes/Work/a.md">Sync</a>', html)

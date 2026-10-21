@@ -364,10 +364,12 @@ def weekly_digest(root: Path, today, days: int = 7) -> tuple[str, int]:
         title = note_title(text, path.stem)
         rel = rel_of(root, path)
         summary = note_summary(text, 200)
-        lines.append(f"- {day:%a %-d %b} · [{title}](/notes/{urllib.parse.quote(rel)})" + (f": {summary}" if summary else ""))
+        label = title.replace("[", "(").replace("]", ")")
+        lines.append(f"- {day:%a %-d %b} · [{label}](/notes/{urllib.parse.quote(rel)})" + (f": {summary}" if summary else ""))
         open_items += [(a["text"], title) for a in note_actions(text) if not a["done"]]
     if not picked:
         lines.append("No notes for recordings from these days.")
     lines += ["", "## Open action items"]
-    lines += [f"- [ ] {item} _(from {title})_" for item, title in open_items] or ["None."]
+    # Plain bullets, not checkboxes: the items live in their own notes, and ticking happens there.
+    lines += [f"- {item} _(from {title})_" for item, title in open_items] or ["None."]
     return "\n".join(lines) + "\n", len(picked)
