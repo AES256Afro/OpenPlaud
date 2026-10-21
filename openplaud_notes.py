@@ -334,3 +334,40 @@ def note_actions(text: str, with_lines: bool = False) -> list[dict]:
 def plaud_id(text: str) -> str | None:
     m = PLAUD_ID_LINE.search(text)
     return m.group(1) if m else None
+
+
+def weekly_digest(root: Path, today, days: int = 7) -> tuple[str, int]:
+    """A digest of the notes for recordings made in the last `days` days: one line each, then every open action
+    item. Built from the notes themselves (no model, no cost). Returns (markdown, number of notes)."""
+    from datetime import date, timedelta
+    since = today - timedelta(days=days - 1)
+    picked = []
+    for path in all_notes(root):
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        if text.startswith("# Weekly digest"):
+            continue
+        m = re.search(r"^- Date: (\d{4}-\d{2}-\d{2})", text, re.M)
+        try:
+            day = date.fromisoformat(m.group(1)) if m else None
+        except ValueError:
+            day = None
+        if day and since <= day <= today:
+            picked.append((day, path, text))
+    picked.sort(key=lambda item: item[0])
+    lines = [f"# Weekly digest {since:%-d %b} – {today:%-d %b %Y}", "",
+             f"- Date: {today.isoformat()}", f"- Notes: {len(picked)}", "", "## Recordings"]
+    open_items = []
+    for day, path, text in picked:
+        title = note_title(text, path.stem)
+        rel = rel_of(root, path)
+        summary = note_summary(text, 200)
+        lines.append(f"- {day:%a %-d %b} · [{title}](/notes/{urllib.parse.quote(rel)})" + (f": {summary}" if summary else ""))
+        open_items += [(a["text"], title) for a in note_actions(text) if not a["done"]]
+    if not picked:
+        lines.append("No notes for recordings from these days.")
+    lines += ["", "## Open action items"]
+    lines += [f"- [ ] {item} _(from {title})_" for item, title in open_items] or ["None."]
+    return "\n".join(lines) + "\n", len(picked)
