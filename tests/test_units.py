@@ -454,3 +454,10 @@ class CheckClockTests(unittest.TestCase):
         off.checked([time.time()])
         self.assertIsNone(off.next)
         self.assertFalse(off.stale(5))
+
+    def test_waiting_recordings_are_dated_by_when_plaud_got_them(self):
+        from datetime import datetime, timedelta, timezone
+        two_days_ago = (datetime.now(timezone.utc) - timedelta(days=2)).replace(tzinfo=None).isoformat()
+        local = datetime.fromisoformat(pa.received_at({"created_at": two_days_ago}))
+        self.assertGreater((datetime.now() - local).total_seconds(), 47 * 3600)
+        self.assertLess((datetime.now() - datetime.fromisoformat(pa.received_at({}))).total_seconds(), 5)
