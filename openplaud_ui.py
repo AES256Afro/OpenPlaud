@@ -75,7 +75,7 @@ THEMES = {
 STATUS = {
     "ready": ("Notes ready", "ok"), "filed": ("Filed", "info"), "writing": ("Writing notes…", "warn"),
     "queued": ("Queued", "warn"), "no_transcript": ("No transcript yet", "none"), "new": ("New", "info"),
-    "failed": ("Failed · retried next sync", "warn"), "stuck": ("Failed 5 times · run it by hand", "warn"),
+    "failed": ("Couldn't write notes · will retry", "warn"), "stuck": ("Couldn't write notes after 5 tries · press Write notes", "warn"),
 }
 FILTER_TESTS = {
     "": lambda r: True, "unread": lambda r: r.get("unread"), "actions": lambda r: r.get("actions_open", 0) > 0,
@@ -197,7 +197,7 @@ def topbar(ctx: dict) -> str:
 <button class="btn small">Search</button></form><nav class="row chips" aria-label="Filter recordings">{''.join(chips)}</nav></div>{results}"""
 
 
-def sync_button(label: str = "Sync now", cls: str = "btn primary") -> str:
+def sync_button(label: str = "Check Plaud now", cls: str = "btn primary") -> str:
     return f'<form class="inline" method="post" action="/sync"><button class="{cls}">{e(label)}</button></form>'
 
 
@@ -206,16 +206,17 @@ def sync_text(ctx: dict) -> str:
         return ctx["current"]
     parts = []
     if ctx["last_sync"]:
-        parts.append(f"Synced {ctx['last_sync']}")
-    parts.append(f"next {ctx['next_sync']}" if ctx["next_sync"] else ("auto-sync off" if not ctx["sync_every"] else "first sync soon"))
+        parts.append(f"Checked {ctx['last_sync']}")
+    parts.append(f"next {ctx['next_sync']}" if ctx["next_sync"] else ("automatic checks off" if not ctx["sync_every"] else "first check soon"))
     return " · ".join(parts)
 
 
 def badge(rec: dict) -> str:
     label, kind = STATUS.get(rec["status"], (rec["status"], "none"))
     unread = '<span class="badge info">Unread</span> ' if rec.get("unread") else ""
-    title = f' title="{e(rec["error"])}"' if rec.get("error") and rec["status"] in ("failed", "stuck") else ""
-    return f'{unread}<span class="badge {kind}"{title}>{e(label)}</span>'
+    detail = (f'<span class="muted" style="display:block;font-size:12px;margin-top:2px">{e(rec["error"])}</span>'
+              if rec.get("error") and rec["status"] in ("failed", "stuck") else "")
+    return f'{unread}<span class="badge {kind}">{e(label)}</span>{detail}'
 
 
 def task_options(ctx: dict) -> str:
@@ -232,12 +233,15 @@ def model_select(ctx: dict, label: str) -> str:
 
 
 def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
-    label = "Run again" if rec.get("note_url") else "Run"
+    label = "Write new copy" if rec.get("note_url") else "Write notes"
     return (f'<form class="inline" method="post" action="/process"><input type="hidden" name="id" value="{e(rec["id"])}">'
             f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}">'
             f'<select name="task" aria-label="What to write for {e(rec["name"])}">{task_options(ctx)}</select>'
             f'{model_select(ctx, "Model for " + rec["name"])}'
             f'<button class="btn{" small" if compact else ""}">{label}</button></form>')
+
+
+UNSURE_CONFIRM = ' onsubmit="return confirm(&#39;The last send may have reached Claude. Check claude.ai/code first. Send anyway?&#39;)"'
 
 
 def safe_url(url) -> bool:
@@ -251,9 +255,8 @@ def claude_bits(ctx: dict, rec: dict) -> str:
         return f'<a class="btn small" href="{e(rec["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude ↗</a>'
     if not ctx.get("claude_on"):
         return ""
-    err = f'<span class="muted" style="font-size:12px" title="{e(rec["claude_error"])}">Claude: not sent ⓘ</span>' if rec.get("claude_error") else ""
-    confirm = (' onsubmit="return confirm(\'The last send may have reached Claude. Check claude.ai/code first. Send anyway?\')"'
-               if rec.get("claude_unsure") else "")
+    err = f'<span class="muted" style="font-size:12px">Not sent to Claude: {e(rec["claude_error"])}</span>' if rec.get("claude_error") else ""
+    confirm = UNSURE_CONFIRM if rec.get("claude_unsure") else ""
     return (f'{err}<form class="inline" method="post" action="/claude/send"{confirm}><input type="hidden" name="id" value="{e(rec["id"])}">'
             f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><button class="btn small">Send to Claude</button></form>')
 
@@ -287,7 +290,7 @@ def plaud_panel(ctx: dict) -> str:
         return f"""<div class="panel" style="margin-bottom:14px"><h2 style="margin-top:0">Sign in to Plaud</h2>
 <ol><li>{f'<a class="btn primary" href="{e(p["url"])}" target="_blank" rel="noopener noreferrer">Open the Plaud sign-in page</a>' if safe_url(p.get("url")) else "Plaud's sign-in link looks wrong; start again"} and approve access.</li>
 <li>Your browser then goes to a <code>localhost:8199</code> address that doesn't load. That's expected. Copy that whole address and paste it here within 2 minutes:</li></ol>
-<form method="post" action="/plaud/callback"><input type="text" name="url" placeholder="http://localhost:8199/auth/callback?code=…" required autofocus style="width:100%">
+<form method="post" action="/plaud/callback"><input type="text" name="url" aria-label="Paste the localhost:8199 address here" placeholder="http://localhost:8199/auth/callback?code=…" required autofocus style="width:100%">
 <p><button class="btn primary">Finish signing in</button></p></form>{msg}</div>"""
     if p["state"] == "busy":
         return '<div class="panel" style="margin-bottom:14px">Plaud is busy. Reload in a moment.</div>'
@@ -305,7 +308,7 @@ def account_bits(ctx: dict) -> str:
         who += (f' <span class="badge warn">Plaud sign-in ends {e(h["until"])}: sign out and in again soon</span>' if h["warn"]
                 else f' <span class="muted">· sign-in good until {e(h["until"])} (renews itself)</span>')
     signout = '<form class="inline" method="post" action="/plaud/signout"><button class="btn small">Sign out of Plaud</button></form>' if p["state"] == "signed_in" else ""
-    test = f'<form class="inline" method="post" action="/test"><button class="btn small">Test {e(ctx["provider"])}</button></form>'
+    test = f'<form class="inline" method="post" action="/test"><button class="btn small">Check {e(ctx["provider"])} connection</button></form>'
     logout = '<form class="inline" method="post" action="/logout"><button class="btn small" title="Signs out every browser and phone">Lock</button></form>' if ctx["password"] else ""
     claude = f'<a class="btn small" href="/claude">Claude: {"on" if ctx.get("claude_on") else "set up"}</a>'
     spend = ""
@@ -322,6 +325,11 @@ def activity(ctx: dict, title: str = "Activity", open_: bool = True) -> str:
         f'<details class="panel"><summary>{e(title)} · {e(sync_text(ctx))}</summary><pre class="log" id="log" style="margin-top:10px">{log}</pre></details>'
 
 
+BULK_CONFIRM = ("const n=document.querySelectorAll(&#39;input[form=bulkrun]:checked&#39;).length;"
+                "if(!n){alert(&#39;Tick at least one recording first.&#39;);return false}"
+                "return confirm(&#39;Write notes for &#39;+n+&#39; recording(s)? Each is its own run; paid models charge for each.&#39;)")
+
+
 def recordings_table(ctx: dict, compact: bool = False) -> str:
     recs = ctx["recordings"]
     if recs is None:
@@ -332,10 +340,10 @@ def recordings_table(ctx: dict, compact: bool = False) -> str:
         f'<tr><td style="width:28px"><input type="checkbox" form="bulkrun" name="ids" value="{e(r["id"])}" aria-label="Select {e(r["name"])}"></td>'
         f'<td class="mono when" style="white-space:nowrap">{e(r["when_s"])}</td><td class="hide-sm">{e(r["duration"])}</td>'
         f'<td class="name">{open_link(ctx, r)}</td><td class="status">{badge(r)}</td><td class="acts"><div class="row">{run_form(ctx, r, compact=True)}{claude_bits(ctx, r)}</div></td></tr>' for r in recs)
-    bulk = (f'<form id="bulkrun" class="row" method="post" action="/process-many" style="margin:0 0 8px">'
+    bulk = (f'<form id="bulkrun" class="row" method="post" action="/process-many" style="margin:0 0 8px" onsubmit="{BULK_CONFIRM}">'
             f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><span class="muted" style="font-size:13px">Selected recordings:</span>'
             f'<select name="task" aria-label="What to write for the selected recordings">{task_options(ctx)}</select>'
-            f'{model_select(ctx, "Model for the selected recordings")}<button class="btn small">Run selected</button></form>')
+            f'{model_select(ctx, "Model for the selected recordings")}<button class="btn small">Write notes for selected</button></form>')
     return (f'{bulk}<div class="scroll"><table class="recs"><tr class="head"><th><span class="sr-only">Select</span></th><th>Recorded</th><th class="hide-sm">Length</th>'
             f'<th>Name</th><th>Status</th><th></th></tr>{rows}</table></div>')
 
@@ -632,7 +640,7 @@ q.addEventListener('keydown',ev=>{if(ev.key==='Enter'){ev.preventDefault();const
 
 def palette(ctx: dict) -> str:
     """⌘K / Ctrl-K in every look: sync, open, run, send, go to a folder or filter, switch look."""
-    cmds = ['<li data-k="sync now refresh check"><form method="post" action="/sync"><button>Sync now</button></form></li>']
+    cmds = ['<li data-k="sync now refresh check"><form method="post" action="/sync"><button>Check Plaud now</button></form></li>']
     for key, label in FILTER_LABELS:
         href = "/" if not key else "/?" + urllib.parse.urlencode({"show": key})
         cmds.append(f'<li data-k="show filter {e(label.lower())}"><a href="{e(href)}">Show: {e(label)}</a></li>')
@@ -645,7 +653,8 @@ def palette(ctx: dict) -> str:
         if safe_url(r.get("claude_url")):
             cmds.append(f'<li data-k="claude open {name}"><a href="{e(r["claude_url"])}" target="_blank" rel="noopener noreferrer">Open in Claude: {e(r["name"])}</a></li>')
         elif ctx.get("claude_on"):
-            cmds.append(f'<li data-k="claude send {name}"><form method="post" action="/claude/send"><input type="hidden" name="id" value="{e(r["id"])}">'
+            unsure = UNSURE_CONFIRM if r.get("claude_unsure") else ""
+            cmds.append(f'<li data-k="claude send {name}"><form method="post" action="/claude/send"{unsure}><input type="hidden" name="id" value="{e(r["id"])}">'
                         f'<button>Send to Claude: {e(r["name"])}</button></form></li>')
     for f in ctx.get("folders", []):
         cmds.append(f'<li data-k="go folder {e(f.lower())}"><a href="{e("/?" + urllib.parse.urlencode({"folder": f}) + "#notes")}">Go to folder: {e(f)}</a></li>')
@@ -770,12 +779,12 @@ def look_phone(ctx):
     css = """.ph{max-width:480px;margin:0 auto;padding:22px 16px 110px} .ph h1{font-size:30px;margin:0}
 .ph .card{margin-bottom:12px;border:0} .ph .btn{min-height:44px}
 .tabbar{position:fixed;left:0;right:0;bottom:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));background:var(--panel);border-top:1px solid var(--line);padding:6px 6px 18px}
-.tabbar a{display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 0;color:var(--muted);text-decoration:none;font-size:12px} .tabbar a:first-child{color:var(--accent)}
+.tabbar a{display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 0;color:var(--muted);text-decoration:none;font-size:12px}
 .ph section{scroll-margin-top:12px} .ph h2{font-size:18px;margin:26px 0 12px}"""
     cards = "".join(f"""<article class="card"><div class="spread muted" style="font-size:13px"><span>{e(r['when_s'])} · {e(r['duration'])}</span>{badge(r)}</div>
 <div style="font-weight:600;font-size:17px;margin:4px 0">{open_link(ctx, r)}</div>{f'<div class="muted">{e(r["summary"])}</div>' if r['summary'] else ''}
 <div class="row" style="margin-top:10px">{run_form(ctx, r)}{claude_bits(ctx, r)}</div></article>""" for r in ctx["recordings"] or []) or recordings_table(ctx)
-    body = f"""<div class="ph"><div class="spread"><h1>Today</h1>{sync_button('Sync')}</div><p class="muted">{e(sync_text(ctx))}</p>
+    body = f"""<div class="ph"><div class="spread"><h1>Recordings</h1>{sync_button('Check Plaud')}</div><p class="muted">{e(sync_text(ctx))}</p>
 <div class="row" style="margin-bottom:10px">{switcher(ctx)}</div>{flash(ctx)}{plaud_panel(ctx)}
 <section id="recordings">{cards}</section><section id="actions"><h2>Action items</h2><div class="card">{actions_list(ctx, limit=10)}</div></section>
 <section id="notes-sec"><h2>Notes</h2>{notes_panel(ctx, breadcrumbs(ctx))}</section><section id="activity"><h2>Activity</h2>{activity(ctx)}<div class="card" style="margin-top:12px">{account_bits(ctx)}</div></section></div>
@@ -793,7 +802,7 @@ def look_console(ctx):
     body = f"""<div class="con"><div class="spread"><div><div class="mono muted" style="font-size:12px">OpenPlaud · {e(ctx['model'])}</div><h1 style="margin:4px 0 0;font-size:26px">Console</h1></div>
 <div class="row">{switcher(ctx)}{sync_button()}</div></div>
 <div class="tiles"><div class="tile"><span class="muted" style="font-size:12px">Plaud</span><b style="color:{'var(--ok-ink)' if p['state'] == 'signed_in' else 'var(--bad-ink)'}">{'Signed in' if p['state'] == 'signed_in' else 'Not signed in'}</b></div>
-<div class="tile"><span class="muted" style="font-size:12px">Sync</span><b>{e(ctx['next_sync'] or ('off' if not ctx['sync_every'] else 'soon'))}</b><span class="muted" style="font-size:12px">{f"every {ctx['sync_every']} min · last {ctx['sync_days']} days" if ctx['sync_every'] else 'automatic sync is off'}</span></div>
+<div class="tile"><span class="muted" style="font-size:12px">Next check</span><b>{e(ctx['next_sync'] or ('off' if not ctx['sync_every'] else 'soon'))}</b><span class="muted" style="font-size:12px">{f"every {ctx['sync_every']} min · last {ctx['sync_days']} days" if ctx['sync_every'] else 'automatic checks are off'}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Working on</span><b>{queue_n} recordings</b><span class="muted" style="font-size:12px">{e(ctx['current'] or 'idle')}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Waiting on Plaud</span><b>{waiting} recordings</b><span class="muted" style="font-size:12px">no transcript yet · retried each sync</span></div></div>
 <p class="muted" style="font-size:13px;margin:-6px 0 14px">This month on paid models: ${ctx.get('spend', 0):.2f}{(" of $" + format(ctx['cap'], '.2f') + " cap") if ctx.get('cap') else " (no cap)"}{(" · " + e(ctx['long_rule'])) if ctx.get('long_rule') else ""}</p>
@@ -844,13 +853,13 @@ def claude_page(ctx: dict) -> str:
     else:
         missing = [label for label, ok in (("the fire URL", ctx["url_ok"]), ("the token", ctx["token_set"])) if not ok]
         status = f'<p><span class="badge none">Off</span> Add {" and ".join(missing)} in BoxPilot (OpenPlaud › Settings) to turn it on.</p>'
-    failures = "".join(f'<li><span class="mono">{e(rid)}</span>: {e(f["error"])}</li>' for rid, f in ctx["failed"].items())
+    failures = "".join(f'<li><strong>{e(f.get("name") or rid)}</strong>: {e(f["error"])}</li>' for rid, f in ctx["failed"].items())
     body = f"""<div style="max-width:820px;margin:0 auto;padding:24px 20px 48px"><div class="spread"><a href="/">← OpenPlaud</a>{switcher(ctx)}</div>
 <h1>Send to Claude</h1>{flash(ctx)}{status}
 {f'<div class="panel"><strong>Not sent</strong><ul>{failures}</ul><p class="muted" style="font-size:13px;margin-bottom:0">Rate limits and overloads are retried on the next sync. Other errors wait for you: fix the setting, then use Send to Claude on the recording.</p></div>' if failures else ''}
 <h2>How it works</h2><p>Each new recording's notes and transcript start a session in a Claude <em>scheduled task</em> on your Claude account. The session appears with your other sessions at claude.ai/code and in the Claude app's Code tab, where you can read it and keep chatting. It uses your Claude subscription, not an API key.</p>
 <h2>Set it up once</h2><ol class="stack" style="padding-left:20px">
-<li>Open <a href="https://claude.ai/code/routines" target="_blank" rel="noopener noreferrer">claude.ai/code/routines</a> and create a new scheduled task. Paste the prompt below. Under Connectors, keep only what it needs (Plaud, if you added it).</li>
+<li>Open <a href="https://claude.ai/code/routines" target="_blank" rel="noopener noreferrer">claude.ai/code/routines</a> and create a new scheduled task (Claude calls these Routines). Paste the prompt below. Under Connectors, keep only what it needs (Plaud, if you added it).</li>
 <li>Add an <strong>API</strong> trigger, copy the <strong>Fire URL</strong>, click <strong>Generate token</strong> and copy the token (it is shown once).</li>
 <li>In BoxPilot, open OpenPlaud › Settings and paste them into <strong>Claude fire URL</strong> and <strong>Claude token</strong>.</li></ol>
 <div class="panel"><div class="spread"><strong>Prompt for the scheduled task</strong></div><pre class="log" style="max-height:none;margin-top:8px">{e(ctx['prompt'])}</pre></div>

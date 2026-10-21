@@ -107,7 +107,7 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
         if wait > time.time() or not budget.available():
             why = (f"Claude asked to wait until {datetime.fromtimestamp(wait):%H:%M}" if wait > time.time()
                    else "Claude's hourly limit for this task is nearly used")
-            c["failed"][rid] = {"error": f"Waiting: {why}. Sent on a later sync.", "retryable": True, "at": datetime.now().isoformat()}
+            c["failed"][rid] = {"error": f"Waiting: {why}. Sent on a later check.", "retryable": True, "at": datetime.now().isoformat(), "name": name}
             log(f"… Claude: {why.lower()}, {name} waits for the next sync")
             return
         budget.spend()
@@ -127,7 +127,7 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
         c = claude_state(state)
         c["inflight"].pop(rid, None)
         if failure:
-            c["failed"][rid] = failure
+            c["failed"][rid] = dict(failure, name=name)
             if retry_after:
                 c["not_before"] = time.time() + min(retry_after, 3600)
         else:
@@ -733,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect(back, None if ok else "That note changed since the page loaded; reload and try again.")
         if path == "/sync":
             added = jobs.add(("sync",))
-            return self._redirect(back, "Sync queued." if added else "A sync is already queued.")
+            return self._redirect(back, "Checking Plaud for new recordings. Progress shows under Activity." if added else "A check is already queued.")
         if path in ("/process", "/process-many", "/claude/send"):
             ids = form.get("ids[]", []) if path == "/process-many" else [form.get("id", "")]
             ids = [i for i in ids[:100] if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", i)]
@@ -744,15 +744,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._redirect(back, "Unknown task, or the custom prompt is empty.")
             if not ids or spec not in valid_specs:
-                return self._redirect(back, "Pick a recording and a model.")
+                return self._redirect(back, "Tick at least one recording first.")
             if path == "/claude/send":
                 if not claude_on():
-                    return self._redirect("/claude", "Set the Claude fire URL and token in BoxPilot first.")
+                    return self._redirect("/claude", "Send to Claude isn't set up yet. Follow the steps on this page.")
                 jobs.add(("claude", ids[0]))
                 return self._redirect(back, "Sending to Claude.")
             for file_id in ids:
                 jobs.add(("process", file_id, task, spec, custom if task == "custom" else ""))
-            return self._redirect(back, "Queued." if len(ids) == 1 else f"Queued {len(ids)} recordings.")
+            return self._redirect(back, "Writing notes. This page updates when they're ready." if len(ids) == 1 else f"Writing notes for {len(ids)} recordings. This page updates as each is ready.")
         if path == "/speakers":
             file_id = form.get("id", "")
             labels, names = form.get("label[]", [])[:20], form.get("name[]", [])[:20]
