@@ -40,7 +40,9 @@ After that, recordings sync on a schedule, and each one can also be run by hand.
 | `OPENPLAUD_PASSWORD` | Password for the web page; empty means no password | |
 | `OPENPLAUD_ALLOWED_HOSTS` | Extra host names the page answers to, comma-separated (e.g. `notes.example.org`). IP addresses, `localhost`, `*.local`, single-label names and `*.ts.net` always work; any other name gets *421 Unknown host name*, which blocks DNS-rebinding pages. | |
 | `OPENPLAUD_LOOK` | Default look: `inbox`, `timeline`, `actions`, `command`, `board`, `reader`, `library`, `calendar`, `phone` or `console`. Each browser can pick its own from the page. | `inbox` |
-
+| `OPENPLAUD_LIST_DAYS` | How many days of recordings the page lists | `30` |
+| `OPENPLAUD_MONTHLY_CAP` | Most to spend on paid models in a calendar month, in dollars; `0` means no cap. A capped month refuses models it can't price. | `0` |
+| `OPENPLAUD_LONG_MINUTES` / `OPENPLAUD_LONG_MODEL` | Recordings longer than this many minutes use this model instead, e.g. `120` and `claude:claude-sonnet-5-5` | |
 | `CLAUDE_ROUTINE_URL` | Fire URL of a Claude scheduled task's API trigger (Send to Claude) | |
 | `CLAUDE_ROUTINE_TOKEN` | That trigger's token | |
 
