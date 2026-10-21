@@ -14,6 +14,7 @@ import argparse
 import copy
 import http.client
 import json
+import math
 import os
 import re
 import shutil
@@ -507,9 +508,11 @@ def extra_prices() -> dict[str, tuple[float, float]]:
         name, _, rates = item.strip().partition("=")
         rate_in, _, rate_out = rates.partition("/")
         try:
-            prices[name.strip()] = (float(rate_in), float(rate_out))
+            rates = (float(rate_in), float(rate_out))
         except ValueError:
             continue
+        if all(math.isfinite(r) and r >= 0 for r in rates):
+            prices[name.strip()] = rates
     return prices
 
 
@@ -657,7 +660,7 @@ class ClaudeBackend:
         with stream as s:
             msg = s.get_final_message()
         used_in, used_out = getattr(msg.usage, "input_tokens", 0) or 0, getattr(msg.usage, "output_tokens", 0) or 0
-        self.usage.add(used_in, used_out, claude_cost(self.cfg["model"], used_in, used_out))
+        self.usage.add(used_in, used_out, model_cost(self.cfg["model"], used_in, used_out))
         if msg.stop_reason == "refusal":
             raise RuntimeError("Claude declined to process this recording.")
         return "".join(b.text for b in msg.content if b.type == "text").strip()
