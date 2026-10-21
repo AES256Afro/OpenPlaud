@@ -31,11 +31,16 @@ Do not change any repository; this task only reads and writes the session."""
 
 
 class RoutineError(Exception):
-    def __init__(self, message: str, status: int | None = None, retry_after: int | None = None, retryable: bool = False):
+    """`retryable`: certainly not started, safe to send again automatically. `unknown`: a session may have been
+    started, so only the owner sends it again, after checking Claude. Neither: Claude refused it (bad token, no task)."""
+
+    def __init__(self, message: str, status: int | None = None, retry_after: int | None = None, retryable: bool = False,
+                 unknown: bool = False):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
         self.retryable = retryable
+        self.unknown = unknown
 
 
 def normalize_url(value: str) -> str:
@@ -83,20 +88,20 @@ def fire(url: str, token: str, text: str, timeout: float = 30) -> dict:
         raise RoutineError(f"Claude returned {e.code}: {hints.get(e.code, message or e.reason)}", e.code,
                            int(retry_after) if retry_after and retry_after.isdigit() else None,
                            # Only a rate limit says for certain that no session was started; a 5xx may come after one was.
-                           retryable=e.code == 429) from None
+                           retryable=e.code == 429, unknown=e.code >= 500) from None
     except urllib.error.URLError as e:
         if isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
             # Refused or no address: the request never reached Claude, so trying again later is safe.
             raise RoutineError(f"Couldn't reach Claude ({e.reason}). Tried again on the next check.", retryable=True) from None
         raise RoutineError(f"Couldn't read Claude's answer ({type(e).__name__}). Not retried automatically, to avoid a duplicate "
-                           "session; check claude.ai/code before sending it again.") from None
+                           "session; check claude.ai/code before sending it again.", unknown=True) from None
     except (TimeoutError, OSError, http.client.HTTPException, ValueError) as e:
         # The session may or may not have been created: never repeat automatically.
         raise RoutineError(f"Couldn't read Claude's answer ({type(e).__name__}). Not retried automatically, to avoid a duplicate "
-                           "session; check claude.ai/code before sending it again.") from None
+                           "session; check claude.ai/code before sending it again.", unknown=True) from None
     url = data.get("claude_code_session_url") if isinstance(data, dict) else None
     if not isinstance(data, dict) or data.get("type") != "routine_fire" or not isinstance(url, str) or not url.startswith("https://"):
-        raise RoutineError(f"Unexpected answer from Claude: {str(data)[:200]}. Check claude.ai/code before sending it again.")
+        raise RoutineError(f"Unexpected answer from Claude: {str(data)[:200]}. Check claude.ai/code before sending it again.", unknown=True)
     return {"session_id": data.get("claude_code_session_id"), "session_url": url}
 
 
