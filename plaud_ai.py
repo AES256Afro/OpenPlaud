@@ -449,11 +449,16 @@ def http_json(url: str, body: dict | None, headers: dict, timeout: float, attemp
     for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
+        except ValueError:
+            # The message quotes the address, which may hold a password: name it without one.
+            raise RuntimeError(f"The address {redact_url(url)} isn't usable. Put no user name, password or key in it.") from None
+        try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
-        except (http.client.InvalidURL, ValueError):
-            # These messages quote the address, which may hold a password: name it without one.
+        except http.client.InvalidURL:
             raise RuntimeError(f"The address {redact_url(url)} isn't usable. Put no user name, password or key in it.") from None
+        except ValueError:
+            raise RuntimeError(f"A request header for {redact_url(url)} isn't valid; check the API key for stray spaces or line breaks.") from None
         except urllib.error.HTTPError as e:
             if e.code not in RETRY_STATUS or attempt == attempts - 1:
                 raise
@@ -467,7 +472,10 @@ def http_json(url: str, body: dict | None, headers: dict, timeout: float, attemp
             last = e
             sleep((2, 8, 20)[min(attempt, 2)])
             continue
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise RuntimeError(f"{redact_url(url)} didn't answer with JSON. Is the address right?") from None
     raise last  # pragma: no cover
 
 

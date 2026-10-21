@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -142,7 +143,10 @@ class PlaudSignIn:
             with urllib.request.urlopen(f"{PLAUD_CALLBACK}?{query}", timeout=30):
                 pass
         except urllib.error.URLError as err:
-            self.state["message"] = f"Couldn't finish the sign-in: {err}"
+            self.state["message"] = f"Couldn't finish the sign-in: {err.reason}"
+            return
+        except (http.client.HTTPException, ValueError):
+            self.state["message"] = "That address isn't valid. Copy it again from the browser's address bar."
             return
         if self.thread:
             self.thread.join(timeout=30)

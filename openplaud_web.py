@@ -74,7 +74,7 @@ def settle_claude_inflight() -> int:
         c = claude_state(state)
         for rid, info in c["inflight"].items():
             c["failed"][rid] = {"error": "The app stopped while this was being sent. Check claude.ai/code for its session before "
-                                         "sending it again.", "retryable": False, "at": info.get("at") or datetime.now().isoformat()}
+                                         "sending it again.", "retryable": False, "unknown": True, "at": info.get("at") or datetime.now().isoformat()}
         count = len(c["inflight"])
         c["inflight"] = {}
     return count
@@ -100,7 +100,7 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
             when = pa.recorded_at(rec)
             if rid in c["sent"] or rid in c["inflight"] or (since and when and when < since):
                 return
-            if c["failed"].get(rid, {}).get("retryable") is False:
+            if c["failed"].get(rid, {}).get("unknown"):
                 return  # the last send may have reached Claude: only the owner sends it again
         budget = cr.FireBudget([float(s) for s in c["fires"]])
         wait = c.get("not_before") or 0
@@ -117,11 +117,11 @@ def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: boo
     try:
         result = cr.fire(CLAUDE_URL, CLAUDE_TOKEN, text)
     except cr.RoutineError as err:
-        failure = {"error": str(err), "retryable": err.retryable, "at": datetime.now().isoformat()}
+        failure = {"error": str(err), "retryable": err.retryable, "unknown": err.unknown, "at": datetime.now().isoformat()}
         retry_after = err.retry_after
     except Exception as err:  # the request went out and the answer was unreadable: outcome unknown
         failure = {"error": f"Claude's answer couldn't be read ({type(err).__name__}). Check claude.ai/code before sending it again.",
-                   "retryable": False, "at": datetime.now().isoformat()}
+                   "retryable": False, "unknown": True, "at": datetime.now().isoformat()}
         retry_after = None
     with pa.editing_state() as state:
         c = claude_state(state)
@@ -258,8 +258,13 @@ class Jobs:
             note = nt.note_for(out_dir, state["processed"].get(rid))
             if not note:
                 continue
-            rec = pa.unwrap_file(p.call_json("get_file", file_id=rid))
-            send_to_claude(rec, note, pa.fetch_transcript(p, rid), self.say, manual=True)
+            try:
+                rec = pa.unwrap_file(p.call_json("get_file", file_id=rid))
+                send_to_claude(rec, note, pa.fetch_transcript(p, rid), self.say, manual=True)
+            except pa.NotSignedIn:
+                raise
+            except Exception as err:  # one recording (say, deleted in Plaud) never holds up the others
+                self.say(f"✗ Claude: couldn't retry {failure.get('name') or rid} ({type(err).__name__})")
 
 
 jobs = Jobs()
@@ -430,7 +435,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
                     "note_folder": note["folder"] if note else "", "summary": note["summary"] if note else "",
                     "actions_open": sum(1 for a in note["actions"] if not a["done"]) if note else 0,
                     "claude_url": sent.get(rid, {}).get("session_url"), "claude_error": failed.get(rid, {}).get("error"),
-                    "claude_unsure": failed.get(rid, {}).get("retryable") is False,
+                    "claude_unsure": bool(failed.get(rid, {}).get("unknown")),
                     "unread": bool(note) and rid not in state.get("read", {}),
                     "error": state.get("failed", {}).get(rid, {}).get("error")})
         except TimeoutError:

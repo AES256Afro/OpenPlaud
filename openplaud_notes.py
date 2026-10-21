@@ -11,6 +11,7 @@ import re
 import stat
 import tempfile
 import threading
+import unicodedata
 import urllib.parse
 import uuid
 from datetime import datetime
@@ -19,10 +20,27 @@ from pathlib import Path
 import plaud_ai as pa
 
 # Names start with a letter or digit (any script), so none is hidden or "..". Folder names can't end in .md.
-# Combining accents are allowed (é written as e + accent); Hangul fillers, which show as nothing, are not.
-_NAME_CHARS = r"(?:(?![\u115f\u1160\u3164\uffa0])[\w\u0300-\u036f .-])"
-FOLDER_NAME = re.compile(r"(?!.*\.md$)(?![\u115f\u1160\u3164\uffa0])[^\W_]" + _NAME_CHARS + "{0,59}", re.I)
-PATH_PART = re.compile(r"(?![\u115f\u1160\u3164\uffa0])[^\W_]" + _NAME_CHARS + "{0,199}")
+FILLERS = {"\u115f", "\u1160", "\u3164", "\uffa0"}  # Hangul fillers: letters to Unicode, but they show as nothing
+
+
+class NamePattern:
+    """A file or folder name: starts with a letter or digit (any script), then letters, digits, marks (accents,
+    vowel signs), spaces, dots, dashes and underscores. So no name is hidden, "..", or invisible."""
+
+    def __init__(self, limit: int, folder: bool = False):
+        self.limit, self.folder = limit, folder
+
+    def fullmatch(self, name: str) -> bool:
+        if not name or len(name) > self.limit or (self.folder and name.lower().endswith(".md")):
+            return False
+        if unicodedata.category(name[0])[0] not in "LN" or any(ch in FILLERS for ch in name):
+            return False
+        return all(ch in " ._-" or unicodedata.category(ch)[0] in "LN" or unicodedata.category(ch) in ("Mn", "Mc")
+                   for ch in name)
+
+
+FOLDER_NAME = NamePattern(60, folder=True)
+PATH_PART = NamePattern(200)
 # Every change to the notes folder (moves, renames, ticks) happens one at a time.
 NOTES_LOCK = threading.RLock()
 ACTION_LINE = re.compile(r"^\s*[-*]\s+\[( |x|X)\]\s+(.*)$")

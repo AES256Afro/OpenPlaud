@@ -305,11 +305,11 @@ class SweepOne(unittest.TestCase):
             for _ in range(4):
                 with self.assertRaises(cr.RoutineError) as ctx:
                     cr.fire("x", "t", "hi")
-                outcomes.append(ctx.exception.retryable)
+                outcomes.append((ctx.exception.retryable, ctx.exception.unknown))
         finally:
             cr.normalize_url = old
             server.shutdown()
-        self.assertEqual(outcomes, [False, False, True, False])
+        self.assertEqual(outcomes, [(False, True), (False, True), (True, False), (False, True)])
 
 
 class SweepTwo(unittest.TestCase):
