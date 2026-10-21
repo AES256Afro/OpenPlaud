@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -62,47 +62,72 @@ def claude_on() -> bool:
 
 def claude_state(state: dict) -> dict:
     c = state.setdefault("claude", {})
-    c.setdefault("sent", {})
-    c.setdefault("failed", {})
+    for key in ("sent", "failed", "inflight"):
+        c.setdefault(key, {})
     c.setdefault("fires", [])
     return c
 
 
+def settle_claude_inflight() -> int:
+    """Sends under way when the app stopped have an unknown outcome: never repeated automatically."""
+    with pa.editing_state() as state:
+        c = claude_state(state)
+        for rid, info in c["inflight"].items():
+            c["failed"][rid] = {"error": "The app stopped while this was being sent. Check claude.ai/code for its session before "
+                                         "sending it again.", "retryable": False, "at": info.get("at") or datetime.now().isoformat()}
+        count = len(c["inflight"])
+        c["inflight"] = {}
+    return count
+
+
 def send_to_claude(rec: dict, note_path: Path, transcript: str, log, manual: bool = False) -> None:
     """Fire the scheduled task with this recording's note and transcript. Automatic sends cover only
-    recordings made after sending was switched on, each once; a manual send always goes."""
+    recordings made after sending was switched on, each once; a manual send always goes. The attempt is
+    saved before the request goes out, so a crash mid-send is never followed by a second session."""
     if not claude_on():
         return
-    rid = pa.rec_id(rec)
-    state = pa.load_state()
-    c = claude_state(state)
-    if not manual:
-        since = datetime.fromisoformat(c["since"]) if c.get("since") else None
-        when = pa.recorded_at(rec)
-        if rid in c["sent"] or (since and when and when < since):
+    rid, name = pa.rec_id(rec), str(rec.get("name") or pa.rec_id(rec))
+    with pa.editing_state() as state:
+        c = claude_state(state)
+        if not manual:
+            since = datetime.fromisoformat(c["since"]) if c.get("since") else None
+            when = pa.recorded_at(rec)
+            if rid in c["sent"] or rid in c["inflight"] or (since and when and when < since):
+                return
+        budget = cr.FireBudget([float(s) for s in c["fires"]])
+        wait = c.get("not_before") or 0
+        if wait > time.time() or not budget.available():
+            why = (f"Claude asked to wait until {datetime.fromtimestamp(wait):%H:%M}" if wait > time.time()
+                   else "Claude's hourly limit for this task is nearly used")
+            c["failed"][rid] = {"error": f"Waiting: {why}. Sent on a later sync.", "retryable": True, "at": datetime.now().isoformat()}
+            log(f"… Claude: {why.lower()}, {name} waits for the next sync")
             return
-    budget = cr.FireBudget([float(s) for s in c["fires"]])
-    if not budget.available():
-        c["failed"][rid] = {"error": "Waiting: Claude's hourly limit for this task is nearly used. Sent on a later sync.",
-                            "retryable": True, "at": datetime.now().isoformat()}
-        pa.save_state(state)
-        log(f"… Claude: hourly limit near, {rec.get('name', rid)} waits for the next sync")
-        return
-    text = cr.build_payload(rec.get("name") or rid, pa.recorded_at(rec).strftime("%Y-%m-%d %H:%M") if pa.recorded_at(rec) else "?",
+        budget.spend()
+        c["fires"] = budget.stamps
+        c["inflight"][rid] = {"at": datetime.now().isoformat()}
+    text = cr.build_payload(name, pa.recorded_at(rec).strftime("%Y-%m-%d %H:%M") if pa.recorded_at(rec) else "?",
                             pa.duration(rec), rid, [("Notes written by OpenPlaud", note_path.read_text())], transcript)
-    budget.spend()
-    c["fires"] = budget.stamps
+    result, failure = None, None
     try:
         result = cr.fire(CLAUDE_URL, CLAUDE_TOKEN, text)
     except cr.RoutineError as err:
-        c["failed"][rid] = {"error": str(err), "retryable": err.retryable, "at": datetime.now().isoformat()}
-        pa.save_state(state)
-        log(f"✗ Claude: {rec.get('name', rid)}: {err}")
-        return
-    c["sent"][rid] = {"session_url": result["session_url"], "at": datetime.now().isoformat(), "note": str(note_path)}
-    c["failed"].pop(rid, None)
-    pa.save_state(state)
-    log(f"→ Claude: {rec.get('name', rid)} · {result['session_url']}")
+        failure = {"error": str(err), "retryable": err.retryable, "at": datetime.now().isoformat()}
+        retry_after = err.retry_after
+    except Exception as err:  # the request went out and the answer was unreadable: outcome unknown
+        failure = {"error": f"Claude's answer couldn't be read ({type(err).__name__}). Check claude.ai/code before sending it again.",
+                   "retryable": False, "at": datetime.now().isoformat()}
+        retry_after = None
+    with pa.editing_state() as state:
+        c = claude_state(state)
+        c["inflight"].pop(rid, None)
+        if failure:
+            c["failed"][rid] = failure
+            if retry_after:
+                c["not_before"] = time.time() + min(retry_after, 3600)
+        else:
+            c["sent"][rid] = {"session_url": result["session_url"], "at": datetime.now().isoformat(), "note": str(note_path)}
+            c["failed"].pop(rid, None)
+    log(f"✗ Claude: {name}: {failure['error']}" if failure else f"→ Claude: {name} · {result['session_url']}")
 
 
 # ---------------------------------------------------------------- background jobs
@@ -114,6 +139,7 @@ class Jobs:
         self.current: str | None = None
         self.active_id: str | None = None
         self.pending: set[tuple] = set()
+        self.adding = threading.Lock()
         self.last_sync: str | None = None
         self.next_sync: datetime | None = None
         threading.Thread(target=self._worker, daemon=True).start()
@@ -139,14 +165,16 @@ class Jobs:
         self.log.extend(line.split(" ", 1)[1] if " " in line else line for line in lines)
 
     def add(self, job: tuple) -> bool:
-        if job in self.pending:
-            return False
-        self.pending.add(job)
-        self.queue.put(job)
-        return True
+        with self.adding:
+            if job in self.pending:
+                return False
+            self.pending.add(job)
+            self.queue.put(job)
+            return True
 
     def queued_ids(self) -> set[str]:
-        return {job[1] for job in self.pending if job[0] in ("process", "claude")}
+        with self.adding:
+            return {job[1] for job in self.pending if job[0] in ("process", "claude")}
 
     def _scheduler(self) -> None:
         self.next_sync = datetime.now() + timedelta(seconds=30)
@@ -170,7 +198,8 @@ class Jobs:
             except Exception as err:
                 self.say(f"✗ {type(err).__name__}: {err}")
             finally:
-                self.pending.discard(job)
+                with self.adding:
+                    self.pending.discard(job)
                 self.current = None
                 self.active_id = None
                 plaud.forget()
@@ -200,8 +229,12 @@ class Jobs:
                 pa.process_and_record(p, chosen, rec, instructions, label, out_dir, log=self.say, on_done=self._on_done())
             else:
                 _, file_id = job
+                state = pa.load_state()
+                if file_id in claude_state(state)["sent"]:
+                    self.say(f"– {file_id} is already in Claude; not sent again")
+                    return
                 rec = pa.unwrap_file(p.call_json("get_file", file_id=file_id))
-                note = nt.note_for(out_dir, pa.load_state()["processed"].get(file_id))
+                note = nt.note_for(out_dir, state["processed"].get(file_id))
                 if note:
                     send_to_claude(rec, note, pa.fetch_transcript(p, file_id), self.say, manual=True)
                 else:
@@ -310,14 +343,29 @@ def read_note(root: Path, path: Path) -> dict:
 FILTERS = {key: test for key, test in ui.FILTER_TESTS.items() if key}
 
 
+def note_day(text: str, path: Path):
+    """The day a note's recording was made (its "- Date:" line), else the day the file was written."""
+    m = re.search(r"^- Date: (\d{4}-\d{2}-\d{2})", text, re.M)
+    try:
+        return date.fromisoformat(m.group(1)) if m else datetime.fromtimestamp(path.stat().st_mtime).date()
+    except (ValueError, OSError):
+        return None
+
+
+def query_undo(here: str, raw_path: str) -> str:
+    """The ?undo= move id on a page address, if any (kept out of `here` so it isn't repeated)."""
+    value = urllib.parse.parse_qs(urllib.parse.urlsplit(raw_path).query).get("undo", [""])[0]
+    return value if re.fullmatch(r"[0-9a-f]{12}", value) else ""
+
+
 def mark_read(note_text: str) -> None:
     rid = nt.plaud_id(note_text)
     if not rid:
         return
-    state = pa.load_state()
-    if rid not in state.setdefault("read", {}):
-        state["read"][rid] = datetime.now().isoformat(timespec="seconds")
-        pa.save_state(state)
+    if rid in pa.load_state().get("read", {}):
+        return
+    with pa.editing_state() as state:
+        state.setdefault("read", {}).setdefault(rid, datetime.now().isoformat(timespec="seconds"))
 
 
 def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
@@ -339,7 +387,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         notes.append({"path": path, "rel": nt.rel_of(root, path), "url": nt.note_url(root, path), "stem": path.stem,
                       "folder": nt.rel_of(root, path.parent) if path.parent != root else "", "title": nt.note_title(text, path.stem),
                       "summary": nt.note_summary(text), "actions": nt.note_actions(text, with_lines=True), "plaud_id": nt.plaud_id(text),
-                      "day": datetime.fromtimestamp(path.stat().st_mtime).date()})
+                      "day": note_day(text, path)})
     by_path = {n["path"].resolve(): n for n in notes}
 
     state = pa.load_state()
@@ -363,7 +411,7 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
                 elif note:
                     status = "filed" if note["folder"] else "ready"
                 elif rid in state.get("failed", {}):
-                    status = "failed"
+                    status = "stuck" if state["failed"][rid].get("count", 0) >= pa.MAX_FAILURES else "failed"
                 elif rid in state.get("no_transcript", {}):
                     status = "no_transcript"
                 else:
@@ -465,8 +513,13 @@ def claude_context(look: str, flash: str | None) -> dict:
 
 # ---------------------------------------------------------------- HTTP
 
+class BodyTooLarge(Exception):
+    pass
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "OpenPlaud"
+    timeout = 60  # a client that stops sending is dropped instead of holding a thread
 
     def log_message(self, fmt, *args):
         pass
@@ -484,6 +537,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
         # Not no-referrer: under it browsers send "Origin: null" on every form post, same-site included.
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Content-Security-Policy",
@@ -510,8 +564,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _form(self) -> dict:
         """The posted form; a field sent more than once (selected notes) keeps every value under "<name>[]"."""
-        length = min(int(self.headers.get("Content-Length") or 0), 65536)
-        fields = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= 65536:
+            raise BodyTooLarge
+        fields = urllib.parse.parse_qs(self.rfile.read(length).decode(errors="replace"), keep_blank_values=True)
         form = {k: v[0] for k, v in fields.items()}
         form.update({f"{k}[]": v for k, v in fields.items()})
         return form
@@ -524,6 +583,8 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path.rstrip("/") or "/"
         if path == "/healthz":
             return self._send(200, "ok", "text/plain")
+        if not core.host_allowed(self.headers):
+            return self._send(421, "Unknown host name. Add it to OPENPLAUD_ALLOWED_HOSTS to use it.", "text/plain")
         if not self._authed():
             return self._send(200 if path == "/login" else 401, ui.login_page(self._bare_ctx()))
         query = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
@@ -548,12 +609,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, ui.page(self._bare_ctx(), "Not found", '<p style="padding:20px">No such note. <a href="/#notes">Back</a></p>'))
         if raw:
             return self._send(200, target.read_text(), "text/markdown; charset=utf-8",
-                              {"Content-Disposition": f'attachment; filename="{target.name}"'})
+                              {"Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(target.name)}"})
         look = self._look()
         note = read_note(root, target)
         mark_read(note["text"])
         cfg = pa.load_config()
         ctx = {"look": look, "flash": flash, "here": here, "folder": note["folder"], "folders": nt.all_folders(root),
+               "undo": query_undo(here, self.path),
                "models": model_choices(cfg), "speakers": speakers_for(note["plaud_id"]) if look == "reader" else None}
         with_transcript = look == "reader"
         transcript = transcript_for(nt.plaud_id(note["text"]), True) if with_transcript else None
@@ -561,16 +623,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path.rstrip("/")
-        if not core.same_origin(self.headers):
+        if not core.same_origin(self.headers) or not core.host_allowed(self.headers):
             return self._send(403, "Cross-site request refused.", "text/plain")
-        form = self._form()
+        try:
+            form = self._form()
+        except BodyTooLarge:
+            return self._send(413, "Request too large.", "text/plain")
         back = core.safe_back(form.get("back", "/"))
         if path == "/login":
             if passwords.check(form.get("password", "")):
                 secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
                 cookie = f"{COOKIE}={passwords.make()}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_DAYS * 86400}{secure}"
                 return self._redirect("/", headers={"Set-Cookie": cookie})
-            time.sleep(1)
             return self._send(401, ui.login_page(self._bare_ctx(), "Wrong password."))
         if not self._authed():
             return self._send(401, ui.login_page(self._bare_ctx()))
@@ -594,7 +658,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/folders":
             root = pa.notes_dir(pa.load_config())
             parent, name = nt.inside(root, form.get("parent", "")), form.get("name", "").strip()
-            if not parent or not nt.FOLDER_NAME.fullmatch(name):
+            if not parent or not parent.is_dir() or not nt.FOLDER_NAME.fullmatch(name):
                 return self._redirect(nt.folder_url(form.get("parent", "")), "Folder names use letters, numbers, spaces, dots, dashes and underscores.")
             (parent / name).mkdir(parents=True, exist_ok=True)
             return self._redirect(nt.folder_url(nt.rel_of(root, parent / name)), f"Folder {name} is ready.")
@@ -603,7 +667,10 @@ class Handler(BaseHTTPRequestHandler):
             note, dest = nt.inside(root, form.get("note", "")), nt.inside(root, form.get("dest", ""))
             if not note or note.suffix != ".md" or not note.is_file() or not dest or not dest.is_dir():
                 return self._redirect(back, "That note or folder doesn't exist.")
-            moved, move_id = nt.move_note(root, note, dest)
+            try:
+                moved, move_id = nt.move_note(root, note, dest)
+            except ValueError as err:
+                return self._redirect(back, str(err))
             where = nt.rel_of(root, dest) if dest != root else "the top level"
             if back.startswith("/notes/"):
                 back = nt.note_url(root, moved)
@@ -614,7 +681,7 @@ class Handler(BaseHTTPRequestHandler):
             root = pa.notes_dir(pa.load_config())
             dest = nt.inside(root, form.get("dest", ""))
             picked = [nt.inside(root, rel) for rel in form.get("notes[]", [])[:200]]
-            picked = [n for n in picked if n and n.suffix == ".md" and n.is_file()]
+            picked = [n for n in picked if n and n.suffix == ".md" and n.is_file() and dest and n.parent != dest]
             if not dest or not dest.is_dir() or not picked:
                 return self._redirect(back, "Pick at least one note and a folder.")
             for note in picked:
@@ -679,26 +746,26 @@ class Handler(BaseHTTPRequestHandler):
             labels, names = form.get("label[]", [])[:20], form.get("name[]", [])[:20]
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", file_id) or len(labels) != len(names):
                 return self._redirect(back, "Couldn't save those names.")
-            state = pa.load_state()
-            mapping = state.setdefault("speakers", {}).setdefault(file_id, {})
-            for label, name in zip(labels, names):
-                name = re.sub(r"[\x00-\x1f:\[\]]", "", name).strip()[:40]
-                if name:
-                    mapping[label[:40]] = name
-                else:
-                    mapping.pop(label[:40], None)
-            pa.save_state(state)
+            with pa.editing_state() as state:
+                mapping = state.setdefault("speakers", {}).setdefault(file_id, {})
+                for label, name in zip(labels, names):
+                    name = re.sub(r"[\x00-\x1f:\[\]]", "", name).strip()[:40]
+                    if name:
+                        mapping[label[:40]] = name
+                    else:
+                        mapping.pop(label[:40], None)
             return self._redirect(back, "Speaker names saved. They show in the transcript and in future runs.")
         if path == "/prompts/save":
             name, text = form.get("name", "").strip()[:40], form.get("prompt", "").strip()[:8000]
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", name) or not text:
                 return self._redirect(back, "Give the prompt a short name (letters, numbers, spaces) and some text.")
-            state = pa.load_state()
-            prompts = state.setdefault("prompts", {})
-            if name in prompts:
+            with pa.editing_state() as state:
+                prompts = state.setdefault("prompts", {})
+                taken = name in prompts
+                if not taken:
+                    prompts[name] = text
+            if taken:
                 return self._redirect(back, f"There is already a prompt called {name}; pick another name.")
-            prompts[name] = text
-            pa.save_state(state)
             return self._redirect(back, f"Saved the prompt {name}. It's in every Run menu now.")
         if path == "/test":
             cfg = pa.load_config()
@@ -719,12 +786,12 @@ def main() -> None:
     if DEFAULT_LOOK not in ui.LOOKS:
         raise SystemExit(f"OPENPLAUD_LOOK must be one of {', '.join(ui.LOOKS)}")
     pa.notes_dir(cfg).mkdir(parents=True, exist_ok=True)
+    unknown = settle_claude_inflight()
+    if unknown:
+        print(f"{unknown} Claude send(s) were under way when the app stopped; marked as not sent (check Claude).", flush=True)
     if claude_on():
-        state = pa.load_state()
-        c = claude_state(state)
-        if not c.get("since"):
-            c["since"] = datetime.now().isoformat()
-            pa.save_state(state)
+        with pa.editing_state() as state:
+            claude_state(state).setdefault("since", datetime.now().isoformat())
     elif CLAUDE_URL or CLAUDE_TOKEN:
         print("Send to Claude is off: the fire URL or token is missing or malformed.", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

@@ -8,6 +8,7 @@ whose outcome is unknown (a timeout) is never repeated automatically.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import time
@@ -80,13 +81,16 @@ def fire(url: str, token: str, text: str, timeout: float = 30) -> dict:
                  429: "Claude's hourly limit for this task was reached."}
         raise RoutineError(f"Claude returned {e.code}: {hints.get(e.code, message or e.reason)}", e.code,
                            int(retry_after) if retry_after and retry_after.isdigit() else None,
-                           retryable=e.code in (429, 500, 503)) from None
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+                           # Only a rate limit says for certain that no session was started; a 5xx may come after one was.
+                           retryable=e.code == 429) from None
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError) as e:
         # The session may or may not have been created: never repeat automatically.
-        raise RoutineError(f"Couldn't reach Claude ({e}). Not retried automatically, to avoid a duplicate session.") from None
-    if data.get("type") != "routine_fire" or not data.get("claude_code_session_url"):
-        raise RoutineError(f"Unexpected answer from Claude: {str(data)[:200]}")
-    return {"session_id": data.get("claude_code_session_id"), "session_url": data["claude_code_session_url"]}
+        raise RoutineError(f"Couldn't read Claude's answer ({type(e).__name__}). Not retried automatically, to avoid a duplicate "
+                           "session; check claude.ai/code before sending it again.") from None
+    url = data.get("claude_code_session_url") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("type") != "routine_fire" or not isinstance(url, str) or not url.startswith("https://"):
+        raise RoutineError(f"Unexpected answer from Claude: {str(data)[:200]}. Check claude.ai/code before sending it again.")
+    return {"session_id": data.get("claude_code_session_id"), "session_url": url}
 
 
 def build_payload(title: str, when: str, duration: str, file_id: str, sections: list[tuple[str, str]], transcript: str) -> str:

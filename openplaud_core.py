@@ -6,7 +6,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
+import os
+import re
 import threading
 import time
 import urllib.error
@@ -178,8 +181,16 @@ class Passwords:
         self.days = days
         self.key = hashlib.sha256(salt + password.encode()).digest()
 
+    _guard = threading.Lock()
+
     def check(self, given: str) -> bool:
-        return bool(self.password) and hmac.compare_digest(given.encode(), self.password.encode())
+        """Compare a typed password. Wrong guesses are answered one at a time, a second apart, however many
+        connections send them, so guessing can't be sped up by sending in parallel."""
+        with Passwords._guard:
+            ok = bool(self.password) and hmac.compare_digest(given.encode(), self.password.encode())
+            if not ok:
+                time.sleep(1)
+            return ok
 
     def make(self) -> str:
         expires = str(int(time.time()) + self.days * 86400)
@@ -213,8 +224,36 @@ def cookie(headers, name: str) -> str | None:
     return None
 
 
+SAFE_BACK = re.compile(r"/(?![/\\])[A-Za-z0-9/_.~%?=&#+,:@!-]*")
+
+
 def safe_back(value: str) -> str:
-    return value if value.startswith("/") and not value.startswith("//") else "/"
+    """A path on this site to return to; anything else (another site, a backslash, a line break) becomes "/"."""
+    return value if SAFE_BACK.fullmatch(value or "") else "/"
+
+
+def host_allowed(headers, extra: str = "") -> bool:
+    """Whether the request names this server: an IP address, localhost, a single-label (MagicDNS) name, a
+    tailnet name (*.ts.net) or a host listed in `extra` (comma-separated). Refuses DNS-rebinding pages, which
+    reach the server under the attacker's own domain name."""
+    allowed = {h.strip().lower() for h in (extra or os.environ.get("OPENPLAUD_ALLOWED_HOSTS", "")).split(",") if h.strip()}
+    for value in (headers.get("Host"), headers.get("X-Forwarded-Host")):
+        if value is None:
+            continue
+        host = urllib.parse.urlsplit("//" + value.strip()).hostname or ""
+        if not _host_ok(host, allowed):
+            return False
+    return True
+
+
+def _host_ok(host: str, allowed: set) -> bool:
+    if host in allowed or host in ("localhost",) or host.endswith((".ts.net", ".localhost")) or "." not in host:
+        return bool(host)
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
 
 
 def plaud_health(token_file: Path | None = None) -> dict | None:

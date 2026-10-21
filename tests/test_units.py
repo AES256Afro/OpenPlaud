@@ -187,7 +187,7 @@ class Engine(unittest.TestCase):
 
     def test_damaged_state_is_set_aside_not_deleted(self):
         pa.STATE_PATH.write_text("{not json")
-        self.assertEqual(pa.load_state(), {"processed": {}})
+        self.assertIn("processed", pa.load_state())
         self.assertTrue(any(p.name.startswith(pa.STATE_PATH.name + ".damaged-") for p in pa.STATE_PATH.parent.iterdir()))
 
 
@@ -207,3 +207,106 @@ class Health(unittest.TestCase):
         self.assertTrue(core.plaud_health(self._token({"exp": int(time.time()) + 3600}))["warn"])
         self.assertEqual(core.plaud_health(self._token({}))["until"], None)
         self.assertIsNone(core.plaud_health(Path(tempfile.mkdtemp()) / "missing.json"))
+
+
+class SweepOne(unittest.TestCase):
+    """Regression tests for the first bug and security sweep."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp()).resolve()
+
+    def test_hosts_and_back_paths(self):
+        for ok in ["127.0.0.1:8795", "bigbox.tail6233fa.ts.net", "bigbox:8795", "[::1]:8795", "localhost"]:
+            self.assertTrue(core.host_allowed({"Host": ok}), ok)
+        self.assertFalse(core.host_allowed({"Host": "evil.example:8795"}))
+        self.assertFalse(core.host_allowed({"Host": "127.0.0.1", "X-Forwarded-Host": "evil.example"}))
+        self.assertTrue(core.host_allowed({"Host": "notes.example.org"}, "notes.example.org"))
+        for bad in ["/\\evil.com", "/x\r\nSet-Cookie: a=b", "/x\nb"]:
+            self.assertEqual(core.safe_back(bad), "/", repr(bad))
+        self.assertEqual(core.safe_back("/notes/Work/a%20b.md?x=1#notes"), "/notes/Work/a%20b.md?x=1#notes")
+
+    def test_state_edits_never_lose_each_other(self):
+        import threading
+        pa.save_state({"processed": {}})
+
+        def bump(i):
+            with pa.editing_state() as s:
+                s.setdefault("n", []).append(i)
+        threads = [threading.Thread(target=bump, args=(i,)) for i in range(40)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(sorted(pa.load_state()["n"]), list(range(40)))
+
+    def test_new_notes_and_moves_never_replace(self):
+        a = self.root / "n.md"
+        a.write_text("mine")
+        self.assertEqual(pa.write_new(a, "new").name, "n-2.md")
+        self.assertEqual(a.read_text(), "mine")
+        with self.assertRaises(ValueError):
+            nt.move_note(self.root, a, self.root)
+
+    def test_ticks_keep_line_endings(self):
+        note = self.root / "crlf.md"
+        note.write_bytes(b"# T\r\n\r\n- [ ] Sam: call\r\n- [ ] Priya: book\r\n")
+        self.assertTrue(nt.set_action(note, 2, "Sam: call", True))
+        self.assertEqual(note.read_bytes(), b"# T\r\n\r\n- [x] Sam: call\r\n- [ ] Priya: book\r\n")
+
+    def test_names(self):
+        self.assertIsNotNone(nt.inside(self.root, "Café/réunion.md"))
+        self.assertFalse(nt.FOLDER_NAME.fullmatch("x.md"))
+        self.assertTrue(nt.FOLDER_NAME.fullmatch("Clients 2026"))
+        (self.root / "x.md").mkdir()
+        self.assertEqual(nt.all_notes(self.root), [])
+
+    def test_plaud_gets_no_secrets_and_urls_hide_passwords(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        os.environ["CLAUDE_ROUTINE_TOKEN"] = "tok"
+        os.environ["OPENPLAUD_AUTH_URL_FILE"] = "/tmp/x"
+        env = pa.plaud_env()
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("CLAUDE_ROUTINE_TOKEN", env)
+        self.assertIn("OPENPLAUD_AUTH_URL_FILE", env)
+        backend = pa.LocalBackend(dict(pa.load_config()["local"], base_url="http://user:pw@box:11434/?key=s", model="m"))
+        self.assertNotIn("pw", backend.name)
+        self.assertNotIn("key=s", backend.name)
+
+    def test_unpriced_models_dont_slip_past_the_cap(self):
+        cfg = pa.load_config()
+        self.assertFalse(pa.priced(pa.backend_for(cfg, "chatgpt:gpt-x")))
+        claude = object.__new__(pa.ClaudeBackend)  # no SDK needed to ask about prices
+        claude.cfg = {"model": "claude-haiku-5-5"}
+        self.assertTrue(pa.priced(claude))
+        claude.cfg = {"model": "claude-something-new"}
+        self.assertFalse(pa.priced(claude))
+        self.assertTrue(pa.priced(pa.backend_for(cfg, "local:m")))
+
+    def test_claude_answers_that_cant_be_read_are_never_retried(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import claude_routine as cr
+        replies = [(200, b"not json"), (500, b"{}"), (429, b"{}"), (200, b'{"type": "routine_fire", "claude_code_session_url": "javascript:x"}')]
+
+        class Odd(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                status, body = replies.pop(0)
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        server = HTTPServer(("127.0.0.1", 0), Odd)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        old = cr.normalize_url
+        cr.normalize_url = lambda url: f"http://127.0.0.1:{server.server_port}/fire"
+        try:
+            outcomes = []
+            for _ in range(4):
+                with self.assertRaises(cr.RoutineError) as ctx:
+                    cr.fire("x", "t", "hi")
+                outcomes.append(ctx.exception.retryable)
+        finally:
+            cr.normalize_url = old
+            server.shutdown()
+        self.assertEqual(outcomes, [False, False, True, False])

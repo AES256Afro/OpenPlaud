@@ -18,10 +18,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -123,24 +127,55 @@ def notes_dir(cfg: dict) -> Path:
     return (DATA_DIR / cfg["output_dir"]).resolve()
 
 
-def load_state() -> dict:
-    if not STATE_PATH.exists():
-        return {"processed": {}}
+# One lock for every read-modify-write of the state file: the web threads and the worker share it.
+STATE_LOCK = threading.RLock()
+
+
+def _read_state(path: Path) -> dict | None:
     try:
-        state = json.loads(STATE_PATH.read_text())
-    except ValueError:
-        # Keep the damaged file for inspection (nothing is deleted) and start a fresh record.
-        STATE_PATH.rename(STATE_PATH.with_name(f"{STATE_PATH.name}.damaged-{datetime.now():%Y%m%d-%H%M%S}"))
-        return {"processed": {}}
-    state.setdefault("processed", {})
-    return state
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def load_state() -> dict:
+    with STATE_LOCK:
+        if not STATE_PATH.exists():
+            return {"processed": {}}
+        state = _read_state(STATE_PATH)
+        if state is None:
+            # Keep the damaged file for inspection (nothing is deleted) and fall back to the copy kept before the last save.
+            STATE_PATH.rename(STATE_PATH.with_name(f"{STATE_PATH.name}.damaged-{datetime.now():%Y%m%d-%H%M%S}"))
+            state = _read_state(STATE_PATH.with_name(STATE_PATH.name + ".bak")) or {}
+        state.setdefault("processed", {})
+        return state
 
 
 def save_state(state: dict) -> None:
-    """Write the whole record to a temporary file first, so a crash mid-write never leaves half a file."""
-    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(STATE_PATH)
+    """Write the whole record to a fresh temporary file first, so a crash mid-write never leaves half a file.
+    The previous version is kept beside it as state.json.bak."""
+    with STATE_LOCK:
+        data = json.dumps(state, indent=2)
+        fd, tmp = tempfile.mkstemp(dir=STATE_PATH.parent, prefix=STATE_PATH.name + ".", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if STATE_PATH.exists():
+            bak = STATE_PATH.with_name(STATE_PATH.name + ".bak")
+            shutil.copyfile(STATE_PATH, bak.with_suffix(".bak.tmp"))
+            os.replace(bak.with_suffix(".bak.tmp"), bak)
+        os.replace(tmp, STATE_PATH)
+
+
+@contextmanager
+def editing_state():
+    """Load, change and save the state as one step, so two threads never undo each other's changes."""
+    with STATE_LOCK:
+        state = load_state()
+        yield state
+        save_state(state)
 
 
 def save_transcript(file_id: str, text: str) -> None:
@@ -191,12 +226,20 @@ def log_stderr(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+SECRET_ENV = re.compile(r"API_KEY|_KEY$|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.I)
+
+
+def plaud_env() -> dict:
+    """The environment for the Plaud server process: everything except this app's keys, tokens and passwords."""
+    return {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+
+
 class Plaud:
     """Minimal MCP stdio client for the Plaud server."""
 
     def __init__(self, command: list[str]):
         self.proc = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=plaud_env()
         )
         self._id = 0
         self._rpc("initialize", {
@@ -441,7 +484,9 @@ class LocalBackend:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.base = cfg["base_url"].rstrip("/")
-        self.name = f"{cfg['model']} @ {self.base}"
+        shown = urllib.parse.urlsplit(self.base)
+        # Never show a password or key that is part of the address.
+        self.name = f"{cfg['model']} @ {shown.scheme}://{shown.hostname or ''}{f':{shown.port}' if shown.port else ''}{shown.path.rstrip('/')}"
         self.usage = Usage()
 
     def max_input_tokens(self) -> int:
@@ -635,7 +680,12 @@ def record_usage(backend) -> None:
     u = getattr(backend, "usage", None)
     if not u or not u.calls:
         return
-    state = load_state()
+    with editing_state() as state:
+        _add_usage(state, backend, u)
+    backend.usage = Usage()
+
+
+def _add_usage(state: dict, backend, u) -> None:
     month = state.setdefault("usage", {}).setdefault(datetime.now().strftime("%Y-%m"), {"cost": 0.0, "input": 0, "output": 0, "runs": 0, "models": {}})
     month["cost"] = round(month["cost"] + (u.cost or 0.0), 6)
     month["input"] += u.input
@@ -646,15 +696,20 @@ def record_usage(backend) -> None:
     model["output"] += u.output
     model["cost"] = round(model["cost"] + (u.cost or 0.0), 6)
     model["runs"] += 1
-    save_state(state)
-    backend.usage = Usage()
+    if u.cost is None and getattr(backend, "paid", False):
+        month["unpriced_runs"] = month.get("unpriced_runs", 0) + 1
+        model["unpriced"] = True
+
+
+def priced(backend) -> bool:
+    """Whether a run on this backend can be costed (and so kept under the monthly cap)."""
+    return not getattr(backend, "paid", False) or (isinstance(backend, ClaudeBackend) and backend.cfg["model"] in CLAUDE_PRICES)
 
 
 def record_failure(file_id: str, err: Exception) -> int:
-    state = load_state()
-    entry = state.setdefault("failed", {}).setdefault(file_id, {"count": 0})
-    entry.update(error=str(err)[:300], at=datetime.now().isoformat(timespec="seconds"), count=entry.get("count", 0) + 1)
-    save_state(state)
+    with editing_state() as state:
+        entry = state.setdefault("failed", {}).setdefault(file_id, {"count": 0})
+        entry.update(error=str(err)[:300], at=datetime.now().isoformat(timespec="seconds"), count=entry.get("count", 0) + 1)
     return entry["count"]
 
 
@@ -706,6 +761,18 @@ def unique_path(path: Path) -> Path:
         n += 1
 
 
+def write_new(path: Path, text: str) -> Path:
+    """Write a new file under a name nobody has: an existing file is never replaced, even by a racing writer."""
+    while True:
+        path = unique_path(path)
+        try:
+            with path.open("x") as f:
+                f.write(text)
+            return path
+        except FileExistsError:
+            continue
+
+
 def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_dir: Path, log=log_stderr,
             on_done=None) -> Path:
     fid, title = rec_id(rec), rec.get("name") or rec_id(rec)
@@ -715,6 +782,9 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     save_transcript(fid, transcript)
     transcript = apply_speakers(transcript, load_state().get("speakers", {}).get(fid))
     cap = float(os.environ.get("OPENPLAUD_MONTHLY_CAP", "0") or 0)
+    if cap and getattr(backend, "paid", False) and not priced(backend):
+        raise CapReached(f"A monthly cap is set, but OpenPlaud has no price for {backend.name}, so it can't keep that model "
+                         "under the cap. Pick a Claude model or the local model, or remove the cap.")
     if cap and getattr(backend, "paid", False) and month_spend() >= cap:
         raise CapReached(f"This month's spending cap (${cap:.2f}) is reached; paid runs wait for next month or a higher cap.")
     log(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}")
@@ -723,8 +793,7 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
     finally:
         record_usage(backend)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = unique_path(out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md")
-    path.write_text(
+    path = write_new(out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md",
         f"# {title}\n\n- Date: {recording_date(rec)}\n- Duration: {duration(rec)}\n- Plaud file ID: `{fid}`\n"
         f"- Processed by: {backend.name} on {datetime.now():%Y-%m-%d %H:%M}\n\n{body}\n"
     )
@@ -743,20 +812,18 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
                        on_done=lambda *args: done.append(args) if on_done else None)
     except NoTranscript as e:
         log(f"– skipped {rec.get('name', rec_id(rec))}: {e}")
-        state = load_state()
-        state.setdefault("no_transcript", {})[rec_id(rec)] = datetime.now().isoformat()
-        save_state(state)
+        with editing_state() as state:
+            state.setdefault("no_transcript", {})[rec_id(rec)] = datetime.now().isoformat()
         return None
     except (NotSignedIn, CapReached):
         raise
     except Exception as e:
         record_failure(rec_id(rec), e)
         raise
-    state = load_state()
-    state["processed"][rec_id(rec)] = {"file": str(path), "backend": backend.name, "at": datetime.now().isoformat()}
-    state.setdefault("no_transcript", {}).pop(rec_id(rec), None)
-    state.setdefault("failed", {}).pop(rec_id(rec), None)
-    save_state(state)
+    with editing_state() as state:
+        state["processed"][rec_id(rec)] = {"file": str(path), "backend": backend.name, "at": datetime.now().isoformat()}
+        state.setdefault("no_transcript", {}).pop(rec_id(rec), None)
+        state.setdefault("failed", {}).pop(rec_id(rec), None)
     log(f"✓ {path.name}")
     if on_done and done:
         on_done(*done[0])

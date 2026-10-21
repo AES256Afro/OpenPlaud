@@ -6,7 +6,10 @@ Nothing here deletes or overwrites a note: moves land on a free name (see plaud_
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
+import threading
 import urllib.parse
 import uuid
 from datetime import datetime
@@ -14,8 +17,11 @@ from pathlib import Path
 
 import plaud_ai as pa
 
-FOLDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,59}")
-PATH_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,199}")
+# Names start with a letter or digit (any script), so none is hidden or "..". Folder names can't end in .md.
+FOLDER_NAME = re.compile(r"(?!.*\.md$)[^\W_][\w .-]{0,59}", re.I)
+PATH_PART = re.compile(r"[^\W_][\w .-]{0,199}")
+# Every change to the notes folder (moves, renames, ticks) happens one at a time.
+NOTES_LOCK = threading.RLock()
 ACTION_LINE = re.compile(r"^\s*[-*]\s+\[( |x|X)\]\s+(.*)$")
 PLAUD_ID_LINE = re.compile(r"Plaud file ID:\s*`([A-Za-z0-9_-]+)`")
 
@@ -54,8 +60,16 @@ def all_folders(root: Path) -> list[str]:
 def all_notes(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    return sorted((p for p in root.rglob("*.md") if not any(s.startswith(".") for s in p.relative_to(root).parts)),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
+    found = []
+    for p in root.rglob("*.md"):
+        if any(s.startswith(".") for s in p.relative_to(root).parts):
+            continue
+        try:
+            if p.is_file():
+                found.append((p.stat().st_mtime, p))
+        except OSError:  # moved away while listing
+            continue
+    return [p for _, p in sorted(found, key=lambda pair: pair[0], reverse=True)]
 
 
 def note_for(root: Path, entry: dict | None) -> Path | None:
@@ -73,17 +87,16 @@ MOVES_LOG = "moves.log"
 
 def _repoint(old: Path, new: Path, folder: bool = False) -> None:
     """Keep each recording's link to its note when the note (or a folder holding it) moves."""
-    state = pa.load_state()
     old, new = old.resolve(), new.resolve()
-    for entry in state["processed"].values():
-        path = Path(entry["file"]).resolve() if entry.get("file") else None
-        if not path:
-            continue
-        if path == old:
-            entry["file"] = str(new)
-        elif folder and old in path.parents:
-            entry["file"] = str(new / path.relative_to(old))
-    pa.save_state(state)
+    with pa.editing_state() as state:
+        for entry in state["processed"].values():
+            path = Path(entry["file"]).resolve() if entry.get("file") else None
+            if not path:
+                continue
+            if path == old:
+                entry["file"] = str(new)
+            elif folder and old in path.parents:
+                entry["file"] = str(new / path.relative_to(old))
 
 
 def _log_move(root: Path, kind: str, src: Path, dst: Path) -> str:
@@ -107,30 +120,56 @@ def move_history(root: Path, limit: int = 50) -> list[dict]:
     return entries[::-1][:limit]
 
 
+def _place(src: Path, wanted: Path) -> Path:
+    """Move a file to `wanted`, or to the first free -2, -3… name beside it. Never replaces a file: the new
+    name is claimed with a hard link (which fails if the name exists) before the old one is removed."""
+    while True:
+        target = pa.unique_path(wanted)
+        try:
+            os.link(src, target)
+        except FileExistsError:
+            continue
+        except OSError:  # a filesystem without hard links: fall back to a checked rename (under NOTES_LOCK)
+            if target.exists():
+                continue
+            src.rename(target)
+            return target
+        src.unlink()
+        return target
+
+
 def move_note(root: Path, note: Path, folder: Path) -> tuple[Path, str]:
     """Move a note into a folder. A name that is taken gets a -2 suffix; nothing is replaced.
     Returns the new path and the move's id (for undo)."""
-    target = pa.unique_path(folder / note.name)
-    note.rename(target)
-    _repoint(note, target)
-    return target, _log_move(root, "note", note, target)
+    with NOTES_LOCK:
+        if note.parent.resolve() == folder.resolve():
+            raise ValueError("That note is already in that folder.")
+        target = _place(note, folder / note.name)
+        _repoint(note, target)
+        return target, _log_move(root, "note", note, target)
 
 
 def undo_move(root: Path, move_id: str) -> Path | None:
     """Put a moved note or folder back where it was (under a free name if that spot is taken now)."""
-    entry = next((m for m in move_history(root, 500) if m["id"] == move_id), None)
-    if not entry:
-        return None
-    current, original = inside(root, entry["to"]), inside(root, entry["from"])
-    if not current or not current.exists() or not original:
-        return None
-    original.parent.mkdir(parents=True, exist_ok=True)
-    is_dir = current.is_dir()
-    back = _free_dir(original) if is_dir else pa.unique_path(original)
-    current.rename(back)
-    _repoint(current, back, folder=is_dir)
-    _log_move(root, "undo", current, back)
-    return back
+    with NOTES_LOCK:
+        entry = next((m for m in move_history(root, 500) if m["id"] == move_id), None)
+        if not entry:
+            return None
+        current, original = inside(root, entry["to"]), inside(root, entry["from"])
+        if not current or not current.exists() or not original:
+            return None
+        if current.is_dir() and (original == current or current in original.parents):
+            return None
+        original.parent.mkdir(parents=True, exist_ok=True)
+        is_dir = current.is_dir()
+        if is_dir:
+            back = _free_dir(original)
+            current.rename(back)
+        else:
+            back = _place(current, original)
+        _repoint(current, back, folder=is_dir)
+        _log_move(root, "undo", current, back)
+        return back
 
 
 def _free_dir(path: Path) -> Path:
@@ -146,38 +185,45 @@ def rename_folder(root: Path, folder: Path, new_name: str) -> tuple[Path, str]:
     """Rename a folder. Refuses a name already used beside it rather than merging two folders."""
     if folder == root or not FOLDER_NAME.fullmatch(new_name):
         raise ValueError("Folder names use letters, numbers, spaces, dots, dashes and underscores.")
-    target = folder.parent / new_name
-    if target.exists():
-        raise ValueError(f"There is already a folder called {new_name} here.")
-    folder.rename(target)
-    _repoint(folder, target, folder=True)
-    return target, _log_move(root, "folder", folder, target)
+    with NOTES_LOCK:
+        target = folder.parent / new_name
+        if target.exists():
+            raise ValueError(f"There is already a folder called {new_name} here.")
+        folder.rename(target)
+        _repoint(folder, target, folder=True)
+        return target, _log_move(root, "folder", folder, target)
 
 
 def move_folder(root: Path, folder: Path, dest: Path) -> tuple[Path, str]:
     """Move a folder into another one (never into itself). A taken name gets a -2 suffix."""
     if folder == root or dest == folder or folder in dest.parents:
         raise ValueError("A folder can't be moved into itself.")
-    target = _free_dir(dest / folder.name)
-    folder.rename(target)
-    _repoint(folder, target, folder=True)
-    return target, _log_move(root, "folder", folder, target)
+    if folder.parent == dest:
+        raise ValueError("That folder is already there.")
+    with NOTES_LOCK:
+        target = _free_dir(dest / folder.name)
+        folder.rename(target)
+        _repoint(folder, target, folder=True)
+        return target, _log_move(root, "folder", folder, target)
 
 
 def set_action(path: Path, line_no: int, expected: str, done: bool) -> bool:
     """Tick or untick one action item in a note, changing only that line's box, and only if the line
     still reads as the page showed it. Written through a temporary file, so the note is never half-saved."""
-    lines = path.read_text().split("\n")
-    if not 0 <= line_no < len(lines):
-        return False
-    m = ACTION_LINE.match(lines[line_no])
-    if not m or re.sub(r"\*\*|`", "", m.group(2)).strip() != expected:
-        return False
-    lines[line_no] = re.sub(r"\[( |x|X)\]", "[x]" if done else "[ ]", lines[line_no], count=1)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(lines))
-    tmp.replace(path)
-    return True
+    with NOTES_LOCK:
+        with path.open(newline="") as f:  # keep the note's own line endings
+            lines = f.read().split("\n")
+        if not 0 <= line_no < len(lines):
+            return False
+        m = ACTION_LINE.match(lines[line_no].rstrip("\r"))
+        if not m or re.sub(r"\*\*|`", "", m.group(2)).strip() != expected:
+            return False
+        lines[line_no] = re.sub(r"\[( |x|X)\]", "[x]" if done else "[ ]", lines[line_no], count=1)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
+        with os.fdopen(fd, "w", newline="") as f:
+            f.write("\n".join(lines))
+        os.replace(tmp, path)
+        return True
 
 
 def search(root: Path, query: str, titles: dict[str, str], limit: int = 40) -> list[dict]:
@@ -248,7 +294,7 @@ def note_summary(text: str, limit: int = 260) -> str:
 def note_actions(text: str, with_lines: bool = False) -> list[dict]:
     out = []
     for i, line in enumerate(text.split("\n")):
-        m = ACTION_LINE.match(line)
+        m = ACTION_LINE.match(line.rstrip("\r"))
         if m:
             item = {"done": m.group(1).lower() == "x", "text": re.sub(r"\*\*|`", "", m.group(2)).strip()}
             if with_lines:
