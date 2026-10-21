@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -374,13 +375,74 @@ def strip_reasoning(text: str) -> str:
     return text.strip()
 
 
+RETRY_STATUS = {408, 429, 500, 502, 503, 504, 529}
+
+
+def http_json(url: str, body: dict | None, headers: dict, timeout: float, attempts: int = 3, sleep=time.sleep) -> dict:
+    """POST (or GET without a body) JSON, retrying rate limits, overloads and server errors with backoff.
+    Honors Retry-After up to a minute. Other errors are raised at once."""
+    last: Exception | None = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_STATUS or attempt == attempts - 1:
+                raise
+            wait = e.headers.get("Retry-After")
+            last = e
+            sleep(min(60, int(wait)) if wait and wait.isdigit() else (2, 8, 20)[min(attempt, 2)])
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if attempt == attempts - 1:
+                raise
+            last = e
+            sleep((2, 8, 20)[min(attempt, 2)])
+    raise last  # pragma: no cover
+
+
+class Usage:
+    """Tokens and (for Claude) dollars spent by one backend."""
+
+    def __init__(self):
+        self.input = self.output = self.calls = 0
+        self.cost: float | None = 0.0
+
+    def add(self, input_tokens: int, output_tokens: int, cost: float | None) -> None:
+        self.input += input_tokens or 0
+        self.output += output_tokens or 0
+        self.calls += 1
+        self.cost = None if cost is None or self.cost is None else self.cost + cost
+
+
+# Dollars per million tokens (input, output), from Anthropic's price list. Haiku 5.5 costs more past a
+# 100K-token prompt.
+CLAUDE_PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.00, 10.00), "claude-opus-5-5": (4.00, 20.00)}
+CLAUDE_LONG_PROMPT = {"claude-haiku-5-5": (100_000, (0.50, 2.50))}
+
+
+def claude_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    if model not in CLAUDE_PRICES:
+        return None
+    rate_in, rate_out = CLAUDE_PRICES[model]
+    if model in CLAUDE_LONG_PROMPT and input_tokens > CLAUDE_LONG_PROMPT[model][0]:
+        rate_in, rate_out = CLAUDE_LONG_PROMPT[model][1]
+    return (input_tokens * rate_in + output_tokens * rate_out) / 1_000_000
+
+
+class CapReached(Exception):
+    pass
+
+
 class LocalBackend:
     """Ollama (native API, so context size can be set) or any OpenAI-compatible server."""
+    paid = False
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.base = cfg["base_url"].rstrip("/")
         self.name = f"{cfg['model']} @ {self.base}"
+        self.usage = Usage()
 
     def max_input_tokens(self) -> int:
         return self.cfg["max_context"] - 6000
@@ -401,6 +463,7 @@ class LocalBackend:
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             }
             data = self._post(f"{self.base}/api/chat", body)
+            self.usage.add(data.get("prompt_eval_count", 0), data.get("eval_count", 0), 0.0)
             return data["message"]["content"]
         base = self.base if self.base.endswith("/v1") else self.base + "/v1"
         body = {
@@ -409,20 +472,22 @@ class LocalBackend:
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
         data = self._post(f"{base}/chat/completions", body, self.cfg.get("api_key"))
+        u = data.get("usage") or {}
+        self.usage.add(u.get("prompt_tokens", 0), u.get("completion_tokens", 0), 0.0)
         return data["choices"][0]["message"]["content"]
 
     def _post(self, url: str, body: dict, api_key: str | None = None) -> dict:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        req = urllib.request.Request(url, json.dumps(body).encode(), headers)
         try:
-            with urllib.request.urlopen(req, timeout=self.cfg["timeout"]) as r:
-                return json.loads(r.read())
-        except urllib.error.URLError as e:
+            return http_json(url, body, headers, self.cfg["timeout"])
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"The local model at {url} answered {e.code}: {e.read().decode(errors='replace')[:200]}") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             raise RuntimeError(
                 f"Could not reach local model at {url} ({e}). Is Tailscale up and the server running?"
-            ) from e
+            ) from None
 
     def check(self) -> str:
         url = f"{self.base}/api/tags" if self.cfg["kind"] == "ollama" else f"{self.base.removesuffix('/v1')}/v1/models"
@@ -440,12 +505,15 @@ FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "clau
 
 
 class ClaudeBackend:
+    paid = True
+
     def __init__(self, cfg: dict):
         import anthropic
 
         self.cfg = cfg
-        self.client = anthropic.Anthropic()
+        self.client = anthropic.Anthropic(max_retries=4)
         self.name = cfg["model"]
+        self.usage = Usage()
 
     def max_input_tokens(self) -> int:
         return 800_000
@@ -474,6 +542,8 @@ class ClaudeBackend:
             stream = self.client.messages.stream(**params)
         with stream as s:
             msg = s.get_final_message()
+        used_in, used_out = getattr(msg.usage, "input_tokens", 0) or 0, getattr(msg.usage, "output_tokens", 0) or 0
+        self.usage.add(used_in, used_out, claude_cost(self.cfg["model"], used_in, used_out))
         if msg.stop_reason == "refusal":
             raise RuntimeError("Claude declined to process this recording.")
         return "".join(b.text for b in msg.content if b.type == "text").strip()
@@ -491,11 +561,14 @@ class ClaudeBackend:
 class ChatGPTBackend:
     """OpenAI's Chat Completions API. No sampling parameters: current OpenAI reasoning models reject them."""
 
+    paid = True
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.key = os.environ.get("OPENAI_API_KEY", "").strip()
         self.base = cfg["base_url"].rstrip("/")
         self.name = cfg["model"]
+        self.usage = Usage()
 
     def max_input_tokens(self) -> int:
         return 200_000
@@ -503,17 +576,14 @@ class ChatGPTBackend:
     def _request(self, path: str, body: dict | None = None) -> dict:
         if not self.key:
             raise RuntimeError("No OpenAI key. Set OPENAI_API_KEY (create one at platform.openai.com).")
-        req = urllib.request.Request(
-            f"{self.base}{path}",
-            json.dumps(body).encode() if body is not None else None,
-            {"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"},
-        )
         try:
-            with urllib.request.urlopen(req, timeout=self.cfg["timeout"]) as r:
-                return json.loads(r.read())
+            return http_json(f"{self.base}{path}", body,
+                             {"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"}, self.cfg["timeout"])
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:300]
             raise RuntimeError(f"OpenAI returned {e.code}: {detail}") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            raise RuntimeError(f"Couldn't reach OpenAI ({e}).") from None
 
     def complete(self, system: str, user: str) -> str:
         data = self._request("/chat/completions", {
@@ -521,6 +591,8 @@ class ChatGPTBackend:
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         })
         choice = data["choices"][0]
+        u = data.get("usage") or {}
+        self.usage.add(u.get("prompt_tokens", 0), u.get("completion_tokens", 0), None)
         if choice.get("finish_reason") == "content_filter":
             raise RuntimeError("OpenAI declined to process this recording.")
         return (choice["message"].get("content") or "").strip()
@@ -537,7 +609,56 @@ def make_backend(cfg: dict, name: str):
         return ClaudeBackend(cfg["claude"])
     if name == "chatgpt":
         return ChatGPTBackend(cfg["chatgpt"])
-    raise SystemExit(f"Unknown provider {name!r} (use one of: {', '.join(PROVIDERS)})")
+    raise ValueError(f"Unknown provider {name!r} (use one of: {', '.join(PROVIDERS)})")
+
+
+def backend_for(cfg: dict, spec: str | None):
+    """A backend for "provider:model" (e.g. "claude:claude-sonnet-5-5", "local:qwen3:30b-a3b"), or the default."""
+    if not spec:
+        return make_backend(cfg, cfg["backend"])
+    provider, _, model = spec.partition(":")
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown provider {provider!r}")
+    cfg = copy.deepcopy(cfg)
+    if model:
+        cfg[provider]["model"] = model
+    return make_backend(cfg, provider)
+
+
+def month_spend(state: dict | None = None) -> float:
+    state = state if state is not None else load_state()
+    return float(state.get("usage", {}).get(datetime.now().strftime("%Y-%m"), {}).get("cost", 0.0))
+
+
+def record_usage(backend) -> None:
+    """Add this backend's tokens and cost to the month's totals."""
+    u = getattr(backend, "usage", None)
+    if not u or not u.calls:
+        return
+    state = load_state()
+    month = state.setdefault("usage", {}).setdefault(datetime.now().strftime("%Y-%m"), {"cost": 0.0, "input": 0, "output": 0, "runs": 0, "models": {}})
+    month["cost"] = round(month["cost"] + (u.cost or 0.0), 6)
+    month["input"] += u.input
+    month["output"] += u.output
+    month["runs"] += 1
+    model = month["models"].setdefault(backend.name, {"input": 0, "output": 0, "cost": 0.0, "runs": 0})
+    model["input"] += u.input
+    model["output"] += u.output
+    model["cost"] = round(model["cost"] + (u.cost or 0.0), 6)
+    model["runs"] += 1
+    save_state(state)
+    backend.usage = Usage()
+
+
+def record_failure(file_id: str, err: Exception) -> int:
+    state = load_state()
+    entry = state.setdefault("failed", {}).setdefault(file_id, {"count": 0})
+    entry.update(error=str(err)[:300], at=datetime.now().isoformat(timespec="seconds"), count=entry.get("count", 0) + 1)
+    save_state(state)
+    return entry["count"]
+
+
+MAX_FAILURES = 5
 
 
 def run_task(backend, transcript: str, instructions: str, title: str, log=log_stderr) -> str:
@@ -593,8 +714,14 @@ def process(plaud: Plaud, backend, rec: dict, instructions: str, task: str, out_
         raise NoTranscript("no transcript yet (transcribe it in the Plaud app); will retry next sync")
     save_transcript(fid, transcript)
     transcript = apply_speakers(transcript, load_state().get("speakers", {}).get(fid))
+    cap = float(os.environ.get("OPENPLAUD_MONTHLY_CAP", "0") or 0)
+    if cap and getattr(backend, "paid", False) and month_spend() >= cap:
+        raise CapReached(f"This month's spending cap (${cap:.2f}) is reached; paid runs wait for next month or a higher cap.")
     log(f"→ {title} ({duration(rec)}, ~{estimate_tokens(transcript):,} tokens) with {backend.name}")
-    body = run_task(backend, transcript, instructions, title, log)
+    try:
+        body = run_task(backend, transcript, instructions, title, log)
+    finally:
+        record_usage(backend)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = unique_path(out_dir / f"{recording_date(rec)}-{slug(title)}-{task}.md")
     path.write_text(
@@ -620,9 +747,15 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
         state.setdefault("no_transcript", {})[rec_id(rec)] = datetime.now().isoformat()
         save_state(state)
         return None
+    except (NotSignedIn, CapReached):
+        raise
+    except Exception as e:
+        record_failure(rec_id(rec), e)
+        raise
     state = load_state()
     state["processed"][rec_id(rec)] = {"file": str(path), "backend": backend.name, "at": datetime.now().isoformat()}
     state.setdefault("no_transcript", {}).pop(rec_id(rec), None)
+    state.setdefault("failed", {}).pop(rec_id(rec), None)
     save_state(state)
     log(f"✓ {path.name}")
     if on_done and done:
@@ -631,11 +764,18 @@ def process_and_record(plaud: Plaud, backend, rec: dict, instructions: str, task
 
 
 def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir: Path,
-         force: bool = False, log=log_stderr, on_start=None, on_done=None) -> tuple[list[Path], int]:
-    """Process every recording from the last `days` days not yet done. Returns (written notes, failure count)."""
+         force: bool = False, log=log_stderr, on_start=None, on_done=None, pick=None) -> tuple[list[Path], int]:
+    """Process every recording from the last `days` days not yet done. Returns (written notes, failure count).
+    `pick(rec)` may return a different backend for one recording (a routing rule). A recording that failed
+    MAX_FAILURES times waits for a run by hand."""
     since = (date.today() - timedelta(days=days)).isoformat()
-    done = load_state()["processed"]
-    targets = [r for r in list_recordings(plaud, since, None, None) if force or rec_id(r) not in done]
+    state = load_state()
+    done, failed = state["processed"], state.get("failed", {})
+    recs = list_recordings(plaud, since, None, None)
+    stuck = [r for r in recs if rec_id(r) not in done and failed.get(rec_id(r), {}).get("count", 0) >= MAX_FAILURES]
+    targets = [r for r in recs if force or (rec_id(r) not in done and r not in stuck)]
+    if stuck:
+        log(f"… {len(stuck)} recording(s) failed {MAX_FAILURES} times and wait for a run by hand")
     if not targets:
         log("Nothing new to process.")
     written, failures = [], 0
@@ -643,9 +783,13 @@ def sync(plaud: Plaud, backend, days: int, instructions: str, task: str, out_dir
         if on_start:
             on_start(rec)
         try:
-            path = process_and_record(plaud, backend, rec, instructions, task, out_dir, log, on_done=on_done)
+            path = process_and_record(plaud, (pick(rec) if pick else None) or backend, rec, instructions, task, out_dir, log,
+                                      on_done=on_done)
         except NotSignedIn:
             raise
+        except CapReached as e:
+            log(f"… {e}")
+            break
         except Exception as e:
             failures += 1
             log(f"✗ {rec.get('name', rec_id(rec))}: {e}")

@@ -210,12 +210,25 @@ def badge(rec: dict) -> str:
     return f'{unread}<span class="badge {kind}"{title}>{e(label)}</span>'
 
 
-def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
+def task_options(ctx: dict) -> str:
     opts = "".join(f'<option value="{k}"{" selected" if k == ctx["default_task"] else ""}>{e(v)}</option>' for k, v in ctx["tasks"].items())
+    return opts + "".join(f'<option value="prompt:{e(name)}">{e(name)}</option>' for name in ctx.get("prompts", []))
+
+
+def model_select(ctx: dict, label: str) -> str:
+    models = ctx.get("models") or []
+    if len(models) <= 1:
+        return '<input type="hidden" name="model" value="">'
+    return (f'<select name="model" aria-label="{e(label)}">'
+            + "".join(f'<option value="{e(k)}">{e(v)}</option>' for k, v in models) + "</select>")
+
+
+def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
     label = "Run again" if rec.get("note_url") else "Run"
     return (f'<form class="inline" method="post" action="/process"><input type="hidden" name="id" value="{e(rec["id"])}">'
             f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}">'
-            f'<select name="task" aria-label="What to write for {e(rec["name"])}">{opts}</select>'
+            f'<select name="task" aria-label="What to write for {e(rec["name"])}">{task_options(ctx)}</select>'
+            f'{model_select(ctx, "Model for " + rec["name"])}'
             f'<button class="btn{" small" if compact else ""}">{label}</button></form>')
 
 
@@ -276,7 +289,11 @@ def account_bits(ctx: dict) -> str:
     test = f'<form class="inline" method="post" action="/test"><button class="btn small">Test {e(ctx["provider"])}</button></form>'
     logout = '<form class="inline" method="post" action="/logout"><button class="btn small">Lock</button></form>' if ctx["password"] else ""
     claude = f'<a class="btn small" href="/claude">Claude: {"on" if ctx.get("claude_on") else "set up"}</a>'
-    return f'<div class="row" style="font-size:13px">{who}{signout}{test}{claude}{logout}</div>'
+    spend = ""
+    cap_text = f" of ${ctx['cap']:.2f}" if ctx.get("cap") else ""
+    if ctx.get("spend") or ctx.get("cap"):
+        spend = f'<span class="muted">This month: ${ctx.get("spend", 0):.2f}{cap_text} on paid models</span>'
+    return f'<div class="row" style="font-size:13px">{who}{signout}{test}{claude}{spend}{logout}</div>'
 
 
 def activity(ctx: dict, title: str = "Activity", open_: bool = True) -> str:
@@ -293,9 +310,15 @@ def recordings_table(ctx: dict, compact: bool = False) -> str:
     if not recs:
         return f'<p class="muted">No recordings in the last {ctx["list_days"]} days.</p>'
     rows = "".join(
-        f'<tr><td class="mono" style="white-space:nowrap">{e(r["when_s"])}</td><td class="hide-sm">{e(r["duration"])}</td>'
+        f'<tr><td style="width:28px"><input type="checkbox" form="bulkrun" name="ids" value="{e(r["id"])}" aria-label="Select {e(r["name"])}"></td>'
+        f'<td class="mono" style="white-space:nowrap">{e(r["when_s"])}</td><td class="hide-sm">{e(r["duration"])}</td>'
         f'<td>{open_link(ctx, r)}</td><td>{badge(r)}</td><td><div class="row">{run_form(ctx, r, compact=True)}{claude_bits(ctx, r)}</div></td></tr>' for r in recs)
-    return f'<div class="scroll"><table><tr><th>Recorded</th><th class="hide-sm">Length</th><th>Name</th><th>Status</th><th></th></tr>{rows}</table></div>'
+    bulk = (f'<form id="bulkrun" class="row" method="post" action="/process-many" style="margin:0 0 8px">'
+            f'<input type="hidden" name="back" value="{e(ctx.get("here", "/"))}"><span class="muted" style="font-size:13px">Selected recordings:</span>'
+            f'<select name="task" aria-label="What to write for the selected recordings">{task_options(ctx)}</select>'
+            f'{model_select(ctx, "Model for the selected recordings")}<button class="btn small">Run selected</button></form>')
+    return (f'{bulk}<div class="scroll"><table><tr><th><span class="sr-only">Select</span></th><th>Recorded</th><th class="hide-sm">Length</th>'
+            f'<th>Name</th><th>Status</th><th></th></tr>{rows}</table></div>')
 
 
 def open_link(ctx: dict, rec: dict) -> str:
@@ -710,6 +733,7 @@ def look_console(ctx):
 <div class="tile"><span class="muted" style="font-size:12px">Sync</span><b>{e(ctx['next_sync'] or ('off' if not ctx['sync_every'] else 'soon'))}</b><span class="muted" style="font-size:12px">{f"every {ctx['sync_every']} min · last {ctx['sync_days']} days" if ctx['sync_every'] else 'automatic sync is off'}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Working on</span><b>{queue_n} recordings</b><span class="muted" style="font-size:12px">{e(ctx['current'] or 'idle')}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Waiting on Plaud</span><b>{waiting} recordings</b><span class="muted" style="font-size:12px">no transcript yet · retried each sync</span></div></div>
+<p class="muted" style="font-size:13px;margin:-6px 0 14px">This month on paid models: ${ctx.get('spend', 0):.2f}{(" of $" + format(ctx['cap'], '.2f') + " cap") if ctx.get('cap') else " (no cap)"}{(" · " + e(ctx['long_rule'])) if ctx.get('long_rule') else ""}</p>
 {flash(ctx)}{plaud_panel(ctx)}<div class="two"><section class="panel"><h2 style="font-size:15px;margin-top:0">Recordings</h2>{recordings_table(ctx)}</section>{activity(ctx, "Recent runs")}</div>
 <div style="margin-top:16px">{notes_panel(ctx)}</div><div class="panel" style="margin-top:16px">{account_bits(ctx)}
 <p class="muted" style="font-size:13px;margin-bottom:0">Keys, provider, schedule and the default look are set in BoxPilot (OpenPlaud › Settings). Notes are kept forever.</p></div></div>"""
@@ -732,10 +756,20 @@ def dashboard(ctx: dict) -> str:
 def note_page(ctx: dict, note: dict, transcript: list[str] | None = None, with_transcript: bool = False) -> str:
     side = (f'<aside class="panel" style="flex:1 1 320px;min-width:0;max-height:80vh;overflow:auto"><strong>Transcript</strong>'
             f'<div style="margin-top:12px;font-size:14px">{transcript_html(transcript)}</div></aside>') if with_transcript else ""
+    custom = ""
+    if note.get("plaud_id"):
+        custom = f"""<details class="panel" style="margin-top:16px"><summary>Run this recording with your own prompt</summary>
+<form method="post" action="/process" class="stack" style="margin-top:10px"><input type="hidden" name="id" value="{e(note['plaud_id'])}">
+<input type="hidden" name="task" value="custom"><input type="hidden" name="back" value="{e(ctx.get('here', '/'))}">
+<label for="prompt" class="muted" style="font-size:13px">What should the model write? (A new note is made; this one stays.)</label>
+<textarea id="prompt" name="prompt" rows="4" required maxlength="8000" style="font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)" placeholder="Write a SOAP note from this visit."></textarea>
+<div class="row">{model_select(ctx, "Model for this prompt")}<button class="btn primary">Run</button>
+<label class="muted" style="font-size:13px">Save as <input type="text" name="name" maxlength="40" placeholder="Template name" style="width:150px"></label>
+<button class="btn small" formaction="/prompts/save">Save prompt</button></div></form></details>"""
     body = f"""<div style="max-width:{1240 if with_transcript else 860}px;margin:0 auto;padding:22px 20px 48px">
 <div class="spread" style="margin-bottom:16px"><a href="{e(note['back'])}">← {e(note['folder'] or 'OpenPlaud')}</a>
 <div class="row"><a class="btn small" href="{e(note['url'])}?raw=1">Download Markdown</a>{move_form(ctx, note['rel'], note['folder'])}{switcher(ctx)}</div></div>
-{flash(ctx)}<div style="display:flex;flex-wrap:wrap;gap:20px"><div class="panel note" style="flex:999 1 520px;min-width:0">{note['html']}</div>{side}</div></div>"""
+{flash(ctx)}<div style="display:flex;flex-wrap:wrap;gap:20px"><div class="panel note" style="flex:999 1 520px;min-width:0">{note['html']}</div>{side}</div>{custom}</div>"""
     return page(ctx, note["title"], body)
 
 

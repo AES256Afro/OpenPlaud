@@ -105,3 +105,87 @@ class Web(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Engine(unittest.TestCase):
+    def test_http_json_retries_overloads_and_honors_retry_after(self):
+        import json as _json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        calls = []
+
+        class Flaky(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                calls.append(1)
+                if len(calls) < 3:
+                    self.send_response(503 if len(calls) == 1 else 429)
+                    if len(calls) == 2:
+                        self.send_header("Retry-After", "7")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                data = _json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = HTTPServer(("127.0.0.1", 0), Flaky)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        waits = []
+        out = pa.http_json(f"http://127.0.0.1:{server.server_port}/", {"x": 1}, {"Content-Type": "application/json"}, 5, sleep=waits.append)
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(waits, [2, 7])
+        server.shutdown()
+
+    def test_http_json_does_not_retry_a_bad_request(self):
+        import threading
+        import urllib.error
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Bad(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = HTTPServer(("127.0.0.1", 0), Bad)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        waits = []
+        with self.assertRaises(urllib.error.HTTPError):
+            pa.http_json(f"http://127.0.0.1:{server.server_port}/", {}, {}, 5, sleep=waits.append)
+        self.assertEqual(waits, [])
+        server.shutdown()
+
+    def test_claude_cost(self):
+        self.assertAlmostEqual(pa.claude_cost("claude-haiku-5-5", 12_000, 2_000), (12_000 * 0.10 + 2_000 * 0.50) / 1e6)
+        self.assertAlmostEqual(pa.claude_cost("claude-haiku-5-5", 150_000, 1_000), (150_000 * 0.50 + 1_000 * 2.50) / 1e6)
+        self.assertAlmostEqual(pa.claude_cost("claude-opus-5-5", 1_000_000, 0), 4.0)
+        self.assertIsNone(pa.claude_cost("some-other-model", 10, 10))
+
+    def test_backend_for_spec(self):
+        cfg = pa.load_config()
+        self.assertEqual(pa.backend_for(cfg, "local:qwen3:8b").cfg["model"], "qwen3:8b")
+        self.assertEqual(cfg["local"]["model"], pa.load_config()["local"]["model"])
+        with self.assertRaises(ValueError):
+            pa.backend_for(cfg, "nope:x")
+
+    def test_failures_count_and_clear(self):
+        pa.save_state({"processed": {}})
+        self.assertEqual(pa.record_failure("r9", RuntimeError("boom")), 1)
+        self.assertEqual(pa.record_failure("r9", RuntimeError("boom again")), 2)
+        state = pa.load_state()
+        self.assertEqual(state["failed"]["r9"]["count"], 2)
+        self.assertIn("boom again", state["failed"]["r9"]["error"])
+
+    def test_damaged_state_is_set_aside_not_deleted(self):
+        pa.STATE_PATH.write_text("{not json")
+        self.assertEqual(pa.load_state(), {"processed": {}})
+        self.assertTrue(any(p.name.startswith(pa.STATE_PATH.name + ".damaged-") for p in pa.STATE_PATH.parent.iterdir()))

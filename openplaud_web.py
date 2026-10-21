@@ -32,6 +32,10 @@ SYNC_DAYS = int(os.environ.get("OPENPLAUD_SYNC_DAYS", "7") or 7)
 LIST_DAYS = int(os.environ.get("OPENPLAUD_LIST_DAYS", "30") or 30)
 DEFAULT_TASK = os.environ.get("OPENPLAUD_TASK", "summary")
 DEFAULT_LOOK = os.environ.get("OPENPLAUD_LOOK", "inbox")
+LONG_MINUTES = int(os.environ.get("OPENPLAUD_LONG_MINUTES", "0") or 0)
+LONG_MODEL = os.environ.get("OPENPLAUD_LONG_MODEL", "")
+MONTHLY_CAP = float(os.environ.get("OPENPLAUD_MONTHLY_CAP", "0") or 0)
+ACTIVITY_LOG = pa.DATA_DIR / "activity.log"
 CLAUDE_URL = os.environ.get("CLAUDE_ROUTINE_URL", "")
 CLAUDE_TOKEN = os.environ.get("CLAUDE_ROUTINE_TOKEN", "")
 AUTH_URL_FILE = Path(os.environ.get("OPENPLAUD_AUTH_URL_FILE", "/tmp/openplaud-auth-url"))
@@ -117,7 +121,22 @@ class Jobs:
             threading.Thread(target=self._scheduler, daemon=True).start()
 
     def say(self, message: str) -> None:
-        self.log.append(f"{now()}  {message}")
+        line = f"{now()}  {message}"
+        self.log.append(line)
+        try:
+            if ACTIVITY_LOG.exists() and ACTIVITY_LOG.stat().st_size > 1_000_000:
+                ACTIVITY_LOG.rename(ACTIVITY_LOG.with_name(f"activity-{datetime.now():%Y%m%d-%H%M%S}.log"))
+            with ACTIVITY_LOG.open("a") as f:
+                f.write(f"{datetime.now():%Y-%m-%d} {line}\n")
+        except OSError:
+            pass
+
+    def load_log(self) -> None:
+        try:
+            lines = ACTIVITY_LOG.read_text().splitlines()[-200:]
+        except OSError:
+            return
+        self.log.extend(line.split(" ", 1)[1] if " " in line else line for line in lines)
 
     def add(self, job: tuple) -> bool:
         if job in self.pending:
@@ -146,6 +165,8 @@ class Jobs:
                 self._run(job)
             except pa.NotSignedIn:
                 self.say("Not signed in to Plaud. Sign in from the page to continue.")
+            except pa.CapReached as err:
+                self.say(f"… {err}")
             except Exception as err:
                 self.say(f"✗ {type(err).__name__}: {err}")
             finally:
@@ -166,14 +187,17 @@ class Jobs:
             if job[0] == "sync":
                 self.say(f"Sync started (last {SYNC_DAYS} days, {backend.name})")
                 written, failures = pa.sync(p, backend, SYNC_DAYS, pa.TASKS[DEFAULT_TASK], DEFAULT_TASK, out_dir, log=self.say,
-                                            on_start=lambda rec: setattr(self, "active_id", pa.rec_id(rec)), on_done=self._on_done())
+                                            on_start=lambda rec: setattr(self, "active_id", pa.rec_id(rec)), on_done=self._on_done(),
+                                            pick=lambda rec: route(cfg, rec))
                 self.last_sync = datetime.now().strftime("%-d %b %H:%M")
                 self.say(f"Sync finished: {len(written)} new, {failures} failed")
                 self._retry_claude(p, out_dir)
             elif job[0] == "process":
-                _, file_id, task = job
+                _, file_id, task, spec, custom = job
+                instructions, label = instructions_for(task, custom)
                 rec = pa.unwrap_file(p.call_json("get_file", file_id=file_id))
-                pa.process_and_record(p, backend, rec, pa.TASKS[task], task, out_dir, log=self.say, on_done=self._on_done())
+                chosen = pa.backend_for(cfg, spec) if spec else route(cfg, rec) or backend
+                pa.process_and_record(p, chosen, rec, instructions, label, out_dir, log=self.say, on_done=self._on_done())
             else:
                 _, file_id = job
                 rec = pa.unwrap_file(p.call_json("get_file", file_id=file_id))
@@ -200,6 +224,42 @@ class Jobs:
 
 
 jobs = Jobs()
+jobs.load_log()
+
+
+def route(cfg: dict, rec: dict):
+    """The long-recording rule: recordings longer than OPENPLAUD_LONG_MINUTES use OPENPLAUD_LONG_MODEL."""
+    if LONG_MINUTES and LONG_MODEL and (rec.get("duration") or 0) > LONG_MINUTES * 60_000:
+        return pa.backend_for(cfg, LONG_MODEL)
+    return None
+
+
+def saved_prompts() -> dict:
+    return pa.load_state().get("prompts", {})
+
+
+def instructions_for(task: str, custom: str = "") -> tuple[str, str]:
+    """What to ask for, and the name the note gets: a built-in task, a saved prompt, or a one-off prompt."""
+    if task in pa.TASKS:
+        return pa.TASKS[task], task
+    if task.startswith("prompt:") and task[7:] in saved_prompts():
+        return saved_prompts()[task[7:]], pa.slug(task[7:]).lower()[:30] or "custom"
+    if task == "custom" and custom.strip():
+        return custom.strip(), "custom"
+    raise ValueError("Unknown task.")
+
+
+def model_choices(cfg: dict) -> list[tuple[str, str]]:
+    """The models a run can pick: the default, plus every provider with what it needs configured."""
+    choices = [("", f"Default ({model_label(cfg)})")]
+    if os.environ.get("ANTHROPIC_API_KEY") or cfg["backend"] == "claude":
+        choices += [(f"claude:{m}", f"Claude {name}") for m, name in
+                    (("claude-haiku-5-5", "Haiku 5.5"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-5-5", "Opus 5.5"))]
+    if os.environ.get("OPENAI_API_KEY"):
+        choices.append((f"chatgpt:{cfg['chatgpt']['model']}", f"ChatGPT {cfg['chatgpt']['model']}"))
+    if cfg["backend"] == "local" or os.environ.get("OLLAMA_URL"):
+        choices.append((f"local:{cfg['local']['model']}", f"Local {cfg['local']['model']}"))
+    return choices
 
 
 # ---------------------------------------------------------------- what a page shows
@@ -229,7 +289,8 @@ def read_note(root: Path, path: Path) -> dict:
     text = path.read_text()
     folder = nt.rel_of(root, path.parent) if path.parent != root else ""
     return {"rel": nt.rel_of(root, path), "url": nt.note_url(root, path), "folder": folder, "back": nt.folder_url(folder),
-            "title": nt.note_title(text, path.stem), "html": ui.render_markdown(text), "text": text, "stem": path.stem}
+            "title": nt.note_title(text, path.stem), "html": ui.render_markdown(text), "text": text, "stem": path.stem,
+            "plaud_id": nt.plaud_id(text)}
 
 
 FILTERS = {key: test for key, test in ui.FILTER_TESTS.items() if key}
@@ -367,6 +428,8 @@ def build_context(look: str, query: dict, flash: str | None, here: str) -> dict:
         "tasks": TASK_LABELS, "default_task": DEFAULT_TASK, "note": selected, "transcript": transcript,
         "show": show if show in FILTERS else "", "q": query.get("q", ""), "search": search, "undo": query.get("undo", ""),
         "all_recordings": all_recordings, "moves": nt.move_history(root, 10),
+        "models": model_choices(cfg), "prompts": sorted(saved_prompts()), "spend": pa.month_spend(state), "cap": MONTHLY_CAP,
+        "long_rule": f"Longer than {LONG_MINUTES} min → {LONG_MODEL}" if LONG_MINUTES and LONG_MODEL else "",
     }
 
 
@@ -473,7 +536,9 @@ class Handler(BaseHTTPRequestHandler):
         look = self._look()
         note = read_note(root, target)
         mark_read(note["text"])
-        ctx = {"look": look, "flash": flash, "here": here, "folder": note["folder"], "folders": nt.all_folders(root)}
+        cfg = pa.load_config()
+        ctx = {"look": look, "flash": flash, "here": here, "folder": note["folder"], "folders": nt.all_folders(root),
+               "models": model_choices(cfg)}
         with_transcript = look == "reader"
         transcript = transcript_for(nt.plaud_id(note["text"]), True) if with_transcript else None
         self._send(200, ui.note_page(ctx, note, transcript, with_transcript))
@@ -574,17 +639,36 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/sync":
             added = jobs.add(("sync",))
             return self._redirect(back, "Sync queued." if added else "A sync is already queued.")
-        if path in ("/process", "/claude/send"):
-            file_id, task = form.get("id", ""), form.get("task", DEFAULT_TASK)
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", file_id) or task not in pa.TASKS:
-                return self._redirect(back, "Unknown recording or task.")
+        if path in ("/process", "/process-many", "/claude/send"):
+            ids = form.get("ids[]", []) if path == "/process-many" else [form.get("id", "")]
+            ids = [i for i in ids[:100] if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", i)]
+            task, spec, custom = form.get("task", DEFAULT_TASK), form.get("model", ""), form.get("prompt", "")[:8000]
+            valid_specs = {key for key, _ in model_choices(pa.load_config())}
+            try:
+                instructions_for(task, custom)
+            except ValueError:
+                return self._redirect(back, "Unknown task, or the custom prompt is empty.")
+            if not ids or spec not in valid_specs:
+                return self._redirect(back, "Pick a recording and a model.")
             if path == "/claude/send":
                 if not claude_on():
                     return self._redirect("/claude", "Set the Claude fire URL and token in BoxPilot first.")
-                jobs.add(("claude", file_id))
+                jobs.add(("claude", ids[0]))
                 return self._redirect(back, "Sending to Claude.")
-            jobs.add(("process", file_id, task))
-            return self._redirect(back, "Queued.")
+            for file_id in ids:
+                jobs.add(("process", file_id, task, spec, custom if task == "custom" else ""))
+            return self._redirect(back, "Queued." if len(ids) == 1 else f"Queued {len(ids)} recordings.")
+        if path == "/prompts/save":
+            name, text = form.get("name", "").strip()[:40], form.get("prompt", "").strip()[:8000]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}", name) or not text:
+                return self._redirect(back, "Give the prompt a short name (letters, numbers, spaces) and some text.")
+            state = pa.load_state()
+            prompts = state.setdefault("prompts", {})
+            if name in prompts:
+                return self._redirect(back, f"There is already a prompt called {name}; pick another name.")
+            prompts[name] = text
+            pa.save_state(state)
+            return self._redirect(back, f"Saved the prompt {name}. It's in every Run menu now.")
         if path == "/test":
             cfg = pa.load_config()
             try:

@@ -182,6 +182,30 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue((notes / "Old notes").is_dir())
         self.assertTrue(set(made.values()) - {sam_before} <= set(contents(notes).values()), "a note's content disappeared")
         self.assertEqual(len(contents(notes)), 4)
+
+        # A saved prompt, a one-off prompt and a bulk run: each writes a new note, keeping the rest.
+        self.post("/prompts/save", name="SOAP", prompt="Write a SOAP note.", back="/")
+        self.assertIn('value="prompt:SOAP"', self.get("/", look="console").read().decode())
+        self.post("/prompts/save", name="SOAP", prompt="Something else.", back="/")
+        state = json.loads((self.data / ".plaud_ai_state.json").read_text())
+        self.assertEqual(state["prompts"]["SOAP"], "Write a SOAP note.")
+        self.post("/process", id="rec_sam", task="prompt:SOAP", model="", back="/")
+        self.post("/process", id="rec_sam", task="custom", prompt="List every number mentioned.", model="", back="/")
+        req = urllib.request.Request(self.base + "/process-many",
+                                     urllib.parse.urlencode([("ids", "rec_sync"), ("ids", "rec_long"), ("task", "actions"), ("model", ""), ("back", "/")]).encode(),
+                                     {"Sec-Fetch-Site": "same-origin"})
+        self.opener.open(req, timeout=30)
+        self.wait_idle()
+        names = [p.name for p in notes.rglob("*.md")]
+        self.assertTrue(any("-soap" in n for n in names), names)
+        self.assertTrue(any(n.endswith("-custom.md") for n in names), names)
+        self.assertEqual(sum(n.endswith("-actions.md") for n in names), 2)
+        self.assertEqual(len(names), 8)
+        bad = self.post("/process", id="rec_sam", task="custom", prompt="   ", model="", back="/")
+        self.assertIn("custom prompt is empty", urllib.parse.unquote_plus(bad.geturl()))
+
+        # The activity log is kept on disk.
+        self.assertIn("Sync finished", (self.data / "activity.log").read_text())
         self.assertNotIn("Traceback", self.server_log())
 
 
