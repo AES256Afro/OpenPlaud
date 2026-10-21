@@ -384,3 +384,13 @@ class SweepThree(unittest.TestCase):
         pw.end_all()
         self.assertFalse(pw.valid(token))
         self.assertTrue(pw.valid(pw.make()))
+
+    def test_owner_set_prices(self):
+        os.environ["OPENPLAUD_PRICES"] = "gpt-x=1/10, broken=abc, gpt-y=0.5/2"
+        try:
+            self.assertAlmostEqual(pa.model_cost("gpt-x", 1_000_000, 100_000), 2.0)
+            self.assertIsNone(pa.model_cost("broken", 1, 1))
+            self.assertTrue(pa.priced(pa.backend_for(pa.load_config(), "chatgpt:gpt-y")))
+            self.assertFalse(pa.priced(pa.backend_for(pa.load_config(), "chatgpt:gpt-z")))
+        finally:
+            del os.environ["OPENPLAUD_PRICES"]

@@ -244,6 +244,11 @@ def run_form(ctx: dict, rec: dict, compact: bool = False) -> str:
 UNSURE_CONFIRM = ' onsubmit="return confirm(&#39;The last send may have reached Claude. Check claude.ai/code first. Send anyway?&#39;)"'
 
 
+def unpriced_text(ctx: dict) -> str:
+    n = ctx.get("unpriced_runs") or 0
+    return f" + {n} run{'s' if n != 1 else ''} with no known price (set OPENPLAUD_PRICES)" if n else ""
+
+
 def safe_url(url) -> bool:
     """Only https links from outside (Claude sessions, the Plaud sign-in page) become clickable."""
     return isinstance(url, str) and url.startswith("https://")
@@ -313,8 +318,8 @@ def account_bits(ctx: dict) -> str:
     claude = f'<a class="btn small" href="/claude">Claude: {"on" if ctx.get("claude_on") else "set up"}</a>'
     spend = ""
     cap_text = f" of ${ctx['cap']:.2f}" if ctx.get("cap") else ""
-    if ctx.get("spend") or ctx.get("cap"):
-        spend = f'<span class="muted">This month: ${ctx.get("spend", 0):.2f}{cap_text} on paid models</span>'
+    if ctx.get("spend") or ctx.get("cap") or ctx.get("unpriced_runs"):
+        spend = f'<span class="muted">This month: ${ctx.get("spend", 0):.2f}{cap_text} on paid models{unpriced_text(ctx)}</span>'
     return f'<div class="row" style="font-size:13px">{who}{signout}{test}{claude}{spend}{logout}</div>'
 
 
@@ -805,7 +810,7 @@ def look_console(ctx):
 <div class="tile"><span class="muted" style="font-size:12px">Next check</span><b>{e(ctx['next_sync'] or ('off' if not ctx['sync_every'] else 'soon'))}</b><span class="muted" style="font-size:12px">{f"every {ctx['sync_every']} min · last {ctx['sync_days']} days" if ctx['sync_every'] else 'automatic checks are off'}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Working on</span><b>{queue_n} recordings</b><span class="muted" style="font-size:12px">{e(ctx['current'] or 'idle')}</span></div>
 <div class="tile"><span class="muted" style="font-size:12px">Waiting on Plaud</span><b>{waiting} recordings</b><span class="muted" style="font-size:12px">no transcript yet · checked again each time</span></div></div>
-<p class="muted" style="font-size:13px;margin:-6px 0 14px">This month on paid models: ${ctx.get('spend', 0):.2f}{(" of $" + format(ctx['cap'], '.2f') + " cap") if ctx.get('cap') else " (no cap)"}{(" · " + e(ctx['long_rule'])) if ctx.get('long_rule') else ""}</p>
+<p class="muted" style="font-size:13px;margin:-6px 0 14px">This month on paid models: ${ctx.get('spend', 0):.2f}{(" of $" + format(ctx['cap'], '.2f') + " cap") if ctx.get('cap') else " (no cap)"}{unpriced_text(ctx)}{(" · " + e(ctx['long_rule'])) if ctx.get('long_rule') else ""}</p>
 {flash(ctx)}{plaud_panel(ctx)}<div class="two"><section class="panel"><h2 style="font-size:15px;margin-top:0">Recordings</h2>{recordings_table(ctx)}</section>{activity(ctx, "Recent runs")}</div>
 <div style="margin-top:16px">{notes_panel(ctx)}</div><div class="panel" style="margin-top:16px">{account_bits(ctx)}
 <p class="muted" style="font-size:13px;margin-bottom:0">Keys, provider, schedule and the default look are set in BoxPilot (OpenPlaud › Settings). Notes are kept forever.</p></div></div>"""
